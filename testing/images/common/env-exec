@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Runs a command inside one of the test environments.
+#   usage: env-exec <cpu|sycl> <command> [args...]
+# The runtime library path is rebuilt from the container's base value on every
+# call, so nesting (e.g. a test in the sycl env calling into the cpu env) does
+# not leak the other environment's libraries.
+set -euo pipefail
+
+kind=${1:?usage: env-exec <cpu|sycl> <command> [args...]}
+shift
+prefix="$MAMBA_ROOT_PREFIX/envs/discamb-$kind"
+[ -d "$prefix" ] || { echo "env-exec: unknown environment '$kind'" >&2; exit 2; }
+
+export DISCAMB_BASE_LD_LIBRARY_PATH="${DISCAMB_BASE_LD_LIBRARY_PATH-${LD_LIBRARY_PATH:-}}"
+base=${DISCAMB_BASE_LD_LIBRARY_PATH:+:$DISCAMB_BASE_LD_LIBRARY_PATH}
+
+case "$kind" in
+    sycl)
+        export LD_LIBRARY_PATH="$DPCPP_ROOT/lib:$prefix/lib$base"
+        export ONEAPI_DEVICE_SELECTOR="${TEST_BACKEND}:*"
+        ;;
+    *)
+        export LD_LIBRARY_PATH="$prefix/lib$base"
+        unset ONEAPI_DEVICE_SELECTOR
+        ;;
+esac
+export DISCAMB_TEST_CURRENT_ENV="$kind"
+
+exec micromamba run -p "$prefix" "$@"

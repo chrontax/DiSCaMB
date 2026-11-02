@@ -1,0 +1,15 @@
+# Dependencies shared by both test environments (discamb-cpu and discamb-sycl).
+# The environments differ only in how pyDiSCaMB is built into them.
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - cctbx-base
+  - pybind11
+  - llvm-openmp
+  - pip
+  - scikit-build-core
+  - cmake
+  - ninja
+  - numpy
+  - pytest
