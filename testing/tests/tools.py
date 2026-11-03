@@ -67,7 +67,9 @@ class _MemorySampler:
 
     def read_once(self) -> float:
         try:
-            result = subprocess.run(self.probe_command(), capture_output=True, text=True)
+            result = subprocess.run(
+                self.probe_command(), capture_output=True, text=True
+            )
         except FileNotFoundError:
             raise RuntimeError(f"{self.tool} is not available on PATH") from None
         for line in result.stdout.splitlines():
@@ -164,7 +166,9 @@ def detect_backend() -> str:
         if sampler.available():
             return sampler.backend
     tools = ", ".join(sampler.tool for sampler in SAMPLERS)
-    raise RuntimeError(f"no GPU backend detected: none of these tools is on PATH: {tools}")
+    raise RuntimeError(
+        f"no GPU backend detected: none of these tools is on PATH: {tools}"
+    )
 
 
 def _sampler_type(backend: str) -> Type[_MemorySampler]:
