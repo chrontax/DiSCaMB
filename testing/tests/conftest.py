@@ -16,6 +16,9 @@ from typing import Optional, Sequence, Union
 
 import pytest
 
+WORKLOAD = Path(__file__).parent / "workloads" / "taam_fcalc.py"
+WARMUP_STRUCTURE = "doc/data/tyrosine.pdb"
+
 
 @dataclass(frozen=True)
 class EnvRun:
@@ -26,7 +29,9 @@ class EnvRun:
 
 
 def pytest_configure(config):
-    config.addinivalue_line("markers", "sycl: needs pyDiSCaMB built with SYCL (a GPU backend)")
+    config.addinivalue_line(
+        "markers", "sycl: needs pyDiSCaMB built with SYCL (a GPU backend)"
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -126,9 +131,26 @@ def run_in_env():
             text=True,
             timeout=timeout,
         )
-        result = EnvRun(proc.returncode, proc.stdout, proc.stderr, time.perf_counter() - start)
+        result = EnvRun(
+            proc.returncode, proc.stdout, proc.stderr, time.perf_counter() - start
+        )
         if check and proc.returncode != 0:
             pytest.fail(f"workload exited with {proc.returncode}:\n{proc.stderr}")
         return result
 
     return run
+
+
+@pytest.fixture(scope="session")
+def sycl_warmup(run_in_env, source_dir):
+    """Run Engine4 once on a tiny structure so later SYCL runs exclude kernel JIT.
+
+    The CUDA driver compiles the PTX module on first load and keeps the result
+    in its on-disk cache, so the compile cost is paid here, once per container.
+    """
+    run = run_in_env(
+        WORKLOAD, args=[str(source_dir / WARMUP_STRUCTURE), "CPU_v4", "2.0"]
+    )
+    print(
+        f"\n[sycl warm-up] Engine4 on tyrosine: {run.wall_time_s:.1f}s (includes kernel JIT)"
+    )
