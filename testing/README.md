@@ -43,10 +43,32 @@ logs and `junit.xml` land in `testing/results/<timestamp>/<system>-<backend>/`.
 - `tests/conftest.py` provides fixtures for tests: `run_in_env(env, script)`
   runs Python in the `cpu` or `sycl` environment (timed); also `backend`,
   `system`, `results_dir`, `source_dir`.
+- `tests/tools.py` holds diagnostics importable from tests. `GpuMemoryProfiler`
+  samples GPU memory every 10 ms with the vendor tool of the detected backend
+  (`cuda` -> `nvidia-smi --query-gpu=memory.used --loop-ms=10`):
+
+  ```python
+  from tools import GpuMemoryProfiler
+
+  profiler = GpuMemoryProfiler()
+  profiler.start()
+  run_in_env("sycl", script)
+  profile = profiler.stop()
+  assert profile.peak_above_baseline_mib < 2048  # also .peak_mib, .mean_mib
+  ```
+
+  The backend comes from `DISCAMB_TEST_BACKEND`, falling back to whichever
+  vendor tool is on `PATH`. Sampling covers the whole device, so it also
+  measures work done by a child process started through `run_in_env`.
+  `start()` takes a one-shot reading as `baseline_mib` and raises there if the
+  tool does not work; `stop()` raises if the profiled window was too short for
+  the sampler to produce a reading (vendor tools need ~0.1 s to start).
 
 ## Adding a backend
 
 Add `detect_<backend>` and `docker_gpu_args_<backend>` to `test-linux.sh`,
 append the backend to `SUPPORTED_BACKENDS`, and add
 `images/<system>-<backend>/Dockerfile` setting `TEST_BACKEND` (the SYCL
-`ONEAPI_DEVICE_SELECTOR` backend name) and `SYCL_TARGETS`.
+`ONEAPI_DEVICE_SELECTOR` backend name) and `SYCL_TARGETS`. For memory
+profiling, add a `_MemorySampler` subclass to `tests/tools.py` (backend name,
+vendor tool, command, line parser) and list it in `SAMPLERS`.
