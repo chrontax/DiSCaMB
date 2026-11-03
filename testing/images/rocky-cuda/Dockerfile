@@ -2,7 +2,7 @@
 ARG CUDA_VERSION=12.9.2
 FROM nvidia/cuda:${CUDA_VERSION}-devel-rockylinux9
 
-ARG DPCPP_VERSION=v6.3.0
+ARG DPCPP_VERSION=v7.2.0
 ENV MAMBA_ROOT_PREFIX=/opt/micromamba \
     DPCPP_ROOT=/opt/dpcpp \
     DPCPP_VERSION=${DPCPP_VERSION} \
