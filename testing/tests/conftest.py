@@ -7,6 +7,7 @@ compares the SYCL build against its CPU counterpart.
 
 import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,39 @@ class EnvRun:
     stdout: str
     stderr: str
     wall_time_s: float
+
+
+class _LabeledStream:
+    def __init__(self, stream, label: str) -> None:
+        self._stream = stream
+        self._label = label
+        self._at_line_start = True
+        self._written = False
+
+    def write(self, text: str) -> int:
+        parts = [] if self._written or not text else ["\n"]
+        self._written = self._written or bool(text)
+        for chunk in text.splitlines(keepends=True):
+            if self._at_line_start:
+                parts.append(self._label)
+            parts.append(chunk)
+            self._at_line_start = chunk.endswith("\n")
+        self._stream.write("".join(parts))
+        self._stream.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+@pytest.fixture(autouse=True)
+def _label_test_output(request, monkeypatch):
+    label = f"[{request.node.name}] "
+    monkeypatch.setattr(sys, "stdout", _LabeledStream(sys.stdout, label))
+    monkeypatch.setattr(sys, "stderr", _LabeledStream(sys.stderr, label))
 
 
 def _setting(name: str) -> str:
