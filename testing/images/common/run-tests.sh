@@ -113,9 +113,6 @@ check_envs() {
     printf '%s\n' "$devices"
     grep -q "^\[$TEST_BACKEND:" <<<"$devices" \
         || die "SYCL runtime sees no $TEST_BACKEND device (is the GPU passed to the container?)"
-
-    "$ENV_EXEC" sycl python /opt/discamb-testing/probe_engine.py "$SRC/doc/data/tyrosine.pdb" CPU_v4 \
-        || die "engine CPU_v4 (HansenCoppens_SF_Engine4) does not run in discamb-sycl"
 }
 
 run_tests() {

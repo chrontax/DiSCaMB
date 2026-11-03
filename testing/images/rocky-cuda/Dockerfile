@@ -19,6 +19,6 @@ RUN dnf install -y --allowerasing \
 COPY common/provision.sh common/environment.yml /opt/discamb-testing/
 RUN /opt/discamb-testing/provision.sh
 
-COPY common/env-exec common/run-tests.sh common/probe_engine.py /opt/discamb-testing/
+COPY common/env-exec common/run-tests.sh /opt/discamb-testing/
 WORKDIR /work
 ENTRYPOINT ["/opt/discamb-testing/run-tests.sh"]

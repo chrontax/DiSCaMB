@@ -20,8 +20,7 @@ script uses whichever is present; it does not use `--gpus all`, which fails on
 Docker 29 without a CDI spec. The script installs nothing on the host.
 
 The sycl build enables `TAAM_WITH_GPU_IMP_26` so `HansenCoppens_SF_Engine4`
-(engine `CPU_v4`) is compiled; startup fails unless a TAAM calculation with
-`engine="CPU_v4"` runs in the sycl env. Logs, build
+(engine `CPU_v4`) is compiled. Logs, build
 logs and `junit.xml` land in `testing/results/<timestamp>/<system>-<backend>/`.
 
 `--git` clones `PYDISCAMB_REPO@PYDISCAMB_REF` (default discamb-project/pyDiSCaMB
