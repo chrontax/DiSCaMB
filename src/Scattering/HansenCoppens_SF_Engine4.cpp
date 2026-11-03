@@ -26,6 +26,8 @@
 #endif
 
 #ifdef SYCL
+#include <algorithm>
+#include <numeric>
 #include <sycl/sycl.hpp>
 #include <tuple>
 #include <utility>
@@ -2305,10 +2307,35 @@ void HansenCoppens_SF_Engine4::calculateSF(
     vector_of_Vector3_to_buffer(int, hkl_indices, hkl);
 
     sycl::buffer<std::complex<REAL>> f_buf(hklCount);
-    sycl::buffer<REAL, 2> f_core_buf(sycl::range(hklCount, wfnCount));
-    sycl::buffer<REAL, 2> val_buf(sycl::range(hklCount, comboCount));
-    sycl::buffer<std::complex<REAL>, 2> sym_op_f_mult_buf(
-        sycl::range(hklCount, symOpMultCount));
+    // used atoms ordered by (wfn, combo), so the kernel recomputes the core
+    // and valence form factors only when they change
+    auto atom_order_buf = [&]() {
+        std::vector<int> order(nAtoms);
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+            const int comboA = atomToUsedWfnTypeCombo[a];
+            const int comboB = atomToUsedWfnTypeCombo[b];
+            return std::make_pair(usedWfnTypeCombo[comboA][0], comboA) <
+                   std::make_pair(usedWfnTypeCombo[comboB][0], comboB);
+        });
+        return sycl::buffer<int>(order.begin(), order.end());
+    }();
+
+    // symOp indices grouped by rotation; rotation m owns
+    // multSymOps[multSymOpStart[m] .. multSymOpStart[m + 1])
+    std::vector<int> multSymOpStart(symOpMultCount + 1, 0);
+    for (int symOpIdx = 0; symOpIdx < nSymOps; symOpIdx++)
+        multSymOpStart[symOpToMult[symOpIdx] + 1]++;
+    for (int m = 0; m < symOpMultCount; m++)
+        multSymOpStart[m + 1] += multSymOpStart[m];
+    std::vector<int> multSymOps(nSymOps);
+    {
+        std::vector<int> next(multSymOpStart.begin(), multSymOpStart.end() - 1);
+        for (int symOpIdx = 0; symOpIdx < nSymOps; symOpIdx++)
+            multSymOps[next[symOpToMult[symOpIdx]]++] = symOpIdx;
+    }
+    sycl::buffer<int> mult_sym_ops_buf(multSymOps);
+    sycl::buffer<int> mult_sym_op_start_buf(multSymOpStart);
     sycl::buffer<std::array<int, 2>> used_wfn_type_combo_buf(usedWfnTypeCombo);
     vector_of_objects_to_buffer_of_values_for_property(
         REAL, typeParams, kappa_spherical, type_kappa_spherical);
@@ -2327,7 +2354,6 @@ void HansenCoppens_SF_Engine4::calculateSF(
     sycl::buffer<int> used_types_buf(usedTypes);
     sycl::buffer<int> atom_to_wfn_map_buf(atom_to_wfn_map);
     sycl::buffer<int> atom_to_type_map_buf(atom_to_type_map);
-    sycl::buffer<int> sym_op_to_mult_buf(symOpToMult);
     sycl::buffer<int> sym_op_to_offset_buf(symOpToOffset);
 
     std::vector<std::vector<std::vector<REAL>>> type_p_lm_vec;
@@ -2507,10 +2533,10 @@ void HansenCoppens_SF_Engine4::calculateSF(
 
     queue.submit([&](sycl::handler &cgh) {
         sycl::accessor f_ax(f_buf, cgh, sycl::write_only);
-        sycl::accessor f_core_ax(f_core_buf, cgh, sycl::read_write);
-        sycl::accessor val_ax(val_buf, cgh, sycl::read_write);
-        sycl::accessor sym_op_f_mult_ax(
-            sym_op_f_mult_buf, cgh, sycl::read_write);
+        sycl::accessor atom_order_ax(atom_order_buf, cgh, sycl::read_only);
+        sycl::accessor mult_sym_ops_ax(mult_sym_ops_buf, cgh, sycl::read_only);
+        sycl::accessor mult_sym_op_start_ax(
+            mult_sym_op_start_buf, cgh, sycl::read_only);
         sycl::accessor hkl_ax(hkl_buf, cgh, sycl::read_only);
         sycl::accessor used_wfn_type_combo_ax(
             used_wfn_type_combo_buf, cgh, sycl::read_only);
@@ -2553,8 +2579,6 @@ void HansenCoppens_SF_Engine4::calculateSF(
             local_coordinate_systems_column1_buf, cgh, sycl::read_only);
         sycl::accessor local_coordinate_systems_column2_ax(
             local_coordinate_systems_column2_buf, cgh, sycl::read_only);
-        sycl::accessor sym_op_to_mult_ax(
-            sym_op_to_mult_buf, cgh, sycl::read_only);
         sycl::accessor sym_op_to_offset_ax(
             sym_op_to_offset_buf, cgh, sycl::read_only);
         sycl::accessor r_atom_rot_ax(r_atom_rot_buf, cgh, sycl::read_only);
@@ -2611,71 +2635,60 @@ void HansenCoppens_SF_Engine4::calculateSF(
                                      cartesian_h[2] * cartesian_h[2];
             REAL h_length = sycl::sqrt(h_length_sq);
 
-            auto f_core = f_core_ax[id];
-
-            for (int i = 0; i < wfnCount; ++i) {
-                wfn_param_meta wfn_meta = wfn_param_metas_ax[i];
-                const int kMax = wfn_meta.core_coeff_sz;
-
-                for (int k = 0; k < kMax; k++) {
-                    REAL core_coeff_k =
-                        core_coeffs_ax[wfn_meta.core_coeff_off + k];
-                    REAL core_pow_k = core_pows_ax[wfn_meta.core_pow_off + k];
-                    REAL core_exp_k = core_exps_ax[wfn_meta.core_exp_off + k];
-                    f_core[i] +=
-                        core_coeff_k *
-                        gFunction_sycl(0,
-                                       core_pow_k + 2,
-                                       h_length,
-                                       core_exp_k);  // TODO find out why pow+2
-                                                     // in all gFunction pow
-                }
-                f_core[i] *= four_pi;
-            }
-
-            auto val = val_ax[id];
-            for (int i = 0; i < comboCount; ++i) {
-                const auto &combo =
-                    used_wfn_type_combo_ax[i];  // Use extract combo
-                const auto type_i = used_types_ax[combo[1]];
-                wfn_param_meta wfn_meta = wfn_param_metas_ax[combo[0]];
-                const int kMax = wfn_meta.valence_coeff_sz;
-                const auto h = h_length / type_kappa_spherical_ax[type_i];
-                for (int k = 0; k < kMax; k++) {
-                    REAL valence_pow_k =
-                        valence_pows_ax[wfn_meta.valence_pow_off + k];
-                    REAL valence_exp_k =
-                        valence_exps_ax[wfn_meta.valence_exp_off + k];
-                    REAL valence_coeff_k =
-                        valence_coeffs_ax[wfn_meta.valence_coeff_off + k];
-                    val[i] +=
-                        valence_coeff_k *
-                        gFunction_sycl(0, valence_pow_k + 2, h, valence_exp_k);
-                }
-                val[i] *= type_p_val_ax[type_i] * four_pi;
-            }
-
             sycl::vec<REAL, 3> h_versor = closeToZero(h_length)
                                               ? sycl::vec<REAL, 3>{0}
                                               : cartesian_h / h_length;
 
-            for (int atom_i = 0; atom_i < nAtoms; ++atom_i) {
-                std::complex<REAL> perAtomF = 0.0;
-                auto symOpFMult = sym_op_f_mult_ax[id];
-                for (int i = 0; i < symOpMultCount; ++i) symOpFMult[i] = 0;
-                for (int symOpIdx = 0; symOpIdx < nSymOps; symOpIdx++) {
-                    const int mult = sym_op_to_mult_ax[symOpIdx];
-                    const int r_off = (atom_i * symOpMultCount + mult) * 3;
-                    const int t_off = sym_op_to_offset_ax[symOpIdx] * 3;
-                    REAL phase_angle = 0.0;
-                    for (int k = 0; k < 3; k++)
-                        phase_angle += (r_atom_rot_ax[r_off + k] +
-                                        sym_op_offsets_ax[t_off + k]) *
-                                       cartesian_h[k];
-                    phase_angle *= two_pi;
-                    symOpFMult[mult] += std::complex<REAL>(
-                        sycl::cos(phase_angle), sycl::sin(phase_angle));
+            int current_wfn = -1;
+            int current_combo = -1;
+            REAL f_core = 0.0;
+            REAL val = 0.0;
+
+            for (int atom_ord = 0; atom_ord < nAtoms; ++atom_ord) {
+                const int atom_i = atom_order_ax[atom_ord];
+                const int combo_i = atom_to_used_wfn_type_combo_ax[atom_i];
+                if (combo_i != current_combo) {
+                    const auto combo = used_wfn_type_combo_ax[combo_i];
+                    const wfn_param_meta wfn_meta =
+                        wfn_param_metas_ax[combo[0]];
+                    if (combo[0] != current_wfn) {
+                        f_core = 0.0;
+                        for (int k = 0; k < wfn_meta.core_coeff_sz; k++) {
+                            REAL core_coeff_k =
+                                core_coeffs_ax[wfn_meta.core_coeff_off + k];
+                            REAL core_pow_k =
+                                core_pows_ax[wfn_meta.core_pow_off + k];
+                            REAL core_exp_k =
+                                core_exps_ax[wfn_meta.core_exp_off + k];
+                            // TODO find out why pow+2 in all gFunction pow
+                            f_core +=
+                                core_coeff_k *
+                                gFunction_sycl(
+                                    0, core_pow_k + 2, h_length, core_exp_k);
+                        }
+                        f_core *= four_pi;
+                        current_wfn = combo[0];
+                    }
+
+                    const auto type_i = used_types_ax[combo[1]];
+                    const auto h = h_length / type_kappa_spherical_ax[type_i];
+                    val = 0.0;
+                    for (int k = 0; k < wfn_meta.valence_coeff_sz; k++) {
+                        REAL valence_pow_k =
+                            valence_pows_ax[wfn_meta.valence_pow_off + k];
+                        REAL valence_exp_k =
+                            valence_exps_ax[wfn_meta.valence_exp_off + k];
+                        REAL valence_coeff_k =
+                            valence_coeffs_ax[wfn_meta.valence_coeff_off + k];
+                        val += valence_coeff_k *
+                               gFunction_sycl(
+                                   0, valence_pow_k + 2, h, valence_exp_k);
+                    }
+                    val *= type_p_val_ax[type_i] * four_pi;
+                    current_combo = combo_i;
                 }
+
+                std::complex<REAL> perAtomF = 0.0;
 
                 bool iso = (used_atom_indices_ax[atom_i] + 1 ==
                                     atomic_displacement_parameters_size
@@ -2706,6 +2719,23 @@ void HansenCoppens_SF_Engine4::calculateSF(
                         : 0.0;
 
                 for (int symOpIdx = 0; symOpIdx < symOpMultCount; symOpIdx++) {
+                    std::complex<REAL> symOpFMult = 0.0;
+                    const int r_off = (atom_i * symOpMultCount + symOpIdx) * 3;
+                    for (int j = mult_sym_op_start_ax[symOpIdx];
+                         j < mult_sym_op_start_ax[symOpIdx + 1];
+                         j++) {
+                        const int t_off =
+                            sym_op_to_offset_ax[mult_sym_ops_ax[j]] * 3;
+                        REAL phase_angle = 0.0;
+                        for (int k = 0; k < 3; k++)
+                            phase_angle += (r_atom_rot_ax[r_off + k] +
+                                            sym_op_offsets_ax[t_off + k]) *
+                                           cartesian_h[k];
+                        phase_angle *= two_pi;
+                        symOpFMult += std::complex<REAL>(
+                            sycl::cos(phase_angle), sycl::sin(phase_angle));
+                    }
+
                     REAL localF = iso_temperature_factor;
                     if (not iso) {
                         const int u_off =
@@ -2781,14 +2811,7 @@ void HansenCoppens_SF_Engine4::calculateSF(
                     }
 
                     perAtomF +=
-                        symOpFMult[symOpIdx] * localF *
-                        (dval +
-                         1.0 *
-                             f_core[used_wfn_type_combo_ax
-                                        [atom_to_used_wfn_type_combo_ax[atom_i]]
-                                        [0]] +
-                         val[atom_to_used_wfn_type_combo_ax[atom_i]] +
-                         anomalous);
+                        symOpFMult * localF * (dval + f_core + val + anomalous);
 
                     auto col0 = sym_op_mults_column0_ax[symOpIdx];
                     auto col1 = sym_op_mults_column1_ax[symOpIdx];
@@ -2805,27 +2828,15 @@ void HansenCoppens_SF_Engine4::calculateSF(
                             h_rot[0] * h_rot[2] * 2,
                             h_rot[1] * h_rot[2] * 2};
                         for (int i = 0; i < 6; i++) {
-                            d_adp_p[i] +=
-                                d_adp_p_part[i] * symOpFMult[symOpIdx] *
-                                localF *
-                                (dval +
-                                 f_core[used_wfn_type_combo_ax
-                                            [atom_to_used_wfn_type_combo_ax
-                                                 [atom_i]][0]] +
-                                 val[atom_to_used_wfn_type_combo_ax[atom_i]] +
-                                 anomalous);
+                            d_adp_p[i] += d_adp_p_part[i] * symOpFMult *
+                                          localF *
+                                          (dval + f_core + val + anomalous);
                         }
                     }
                     if (derivativesSwitch.d_xyz) {
                         for (int i = 0; i < 3; i++) {
-                            d_xyz_p[i] +=
-                                h_rot[i] * symOpFMult[symOpIdx] * localF *
-                                (dval +
-                                 f_core[used_wfn_type_combo_ax
-                                            [atom_to_used_wfn_type_combo_ax
-                                                 [atom_i]][0]] +
-                                 val[atom_to_used_wfn_type_combo_ax[atom_i]] +
-                                 anomalous);
+                            d_xyz_p[i] += h_rot[i] * symOpFMult * localF *
+                                          (dval + f_core + val + anomalous);
                         }
                     }
                 }
