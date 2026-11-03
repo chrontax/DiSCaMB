@@ -9,6 +9,8 @@
 #                  git: clone PYDISCAMB_REPO@PYDISCAMB_REF and replace the
 #                       lib/discamb submodule with DISCAMB_REPO@DISCAMB_REF
 #   PYTEST_ARGS    extra arguments passed to pytest (word-split)
+#   DEBUG          1: also print the setup log (always written to
+#                  /results/setup.log); otherwise only pytest output and errors
 #   HOST_UID/GID   owner given to files written to /results
 set -euo pipefail
 
@@ -18,15 +20,26 @@ PYDISCAMB_REF=${PYDISCAMB_REF:-main}
 DISCAMB_REPO=${DISCAMB_REPO:-https://github.com/chrontax/DiSCaMB.git}
 DISCAMB_REF=${DISCAMB_REF:-main}
 PYTEST_ARGS=${PYTEST_ARGS:-}
+DEBUG=${DEBUG:-0}
 
 ENV_EXEC=/opt/discamb-testing/env-exec
 SRC=/work/src
 BUILD=/work/build
 RESULTS=/results
+SETUP_LOG="$RESULTS/setup.log"
 TAG="$TEST_SYSTEM-$TEST_BACKEND"
 
-log() { printf '[%s %s] %s\n' "$(date +%H:%M:%S)" "$TAG" "$*"; }
-die() { log "ERROR: $*" >&2; exit 1; }
+log() {
+    local line
+    line=$(printf '[%s %s] %s' "$(date +%H:%M:%S)" "$TAG" "$*")
+    printf '%s\n' "$line" >>"$SETUP_LOG"
+    if [ "$DEBUG" = 1 ]; then printf '%s\n' "$line"; fi
+}
+die() {
+    printf '[%s] ERROR: %s\n' "$TAG" "$*" >>"$SETUP_LOG"
+    printf '[%s] ERROR: %s (setup log: setup.log)\n' "$TAG" "$*" >&2
+    exit 1
+}
 
 fix_results_owner() {
     if [ -n "${HOST_UID:-}" ] && [ -d "$RESULTS" ]; then
@@ -110,7 +123,7 @@ check_envs() {
     local devices
     devices=$("$ENV_EXEC" sycl "$DPCPP_ROOT/bin/sycl-ls" 2>&1) \
         || die "sycl-ls failed: $devices"
-    printf '%s\n' "$devices"
+    log "sycl-ls:"$'\n'"$devices"
     grep -q "^\[$TEST_BACKEND:" <<<"$devices" \
         || die "SYCL runtime sees no $TEST_BACKEND device (is the GPU passed to the container?)"
 }
@@ -130,11 +143,11 @@ run_tests() {
 
     log "running pytest in $tests_dir"
     local rc=0
-    (cd "$tests_dir" && "$ENV_EXEC" sycl python -m pytest -s -p no:cacheprovider -rA \
+    (cd "$tests_dir" && "$ENV_EXEC" sycl python -m pytest -v -s -p no:cacheprovider -rA \
         --junitxml="$RESULTS/junit.xml" "${extra[@]}" .) || rc=$?
     # pytest exit code 5 means no tests were collected.
     if [ "$rc" -eq 5 ]; then
-        log "no tests collected"
+        printf '[%s] no tests collected\n' "$TAG"
         rc=0
     fi
     return "$rc"

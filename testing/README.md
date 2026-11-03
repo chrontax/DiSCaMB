@@ -10,7 +10,14 @@ lib/discamb/testing/test-linux.sh                 # every detected backend x eve
 lib/discamb/testing/test-linux.sh -s ubuntu       # one system
 lib/discamb/testing/test-linux.sh -- -k memory    # extra pytest arguments
 lib/discamb/testing/test-linux.sh --git           # test git sources instead of the local tree
+lib/discamb/testing/test-linux.sh -d              # also show progress, image builds, setup
 ```
+
+By default the console shows only pytest output (one line per test, with what
+the test prints streamed live and every line prefixed with `[<test name>]`),
+errors and the final summary. Everything else is always saved: `image-build.log`, `setup.log`
+(source copy, environment builds, device check) and `run.log` per
+`<system>-<backend>`; `-d` prints it live as well.
 
 Host requirements: docker, plus for the `cuda` backend the NVIDIA driver and
 NVIDIA Container Toolkit registered with docker, either as the `nvidia` runtime

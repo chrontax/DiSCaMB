@@ -25,11 +25,14 @@ Options:
                           honours PYDISCAMB_REPO, PYDISCAMB_REF, DISCAMB_REPO, DISCAMB_REF
       --rebuild           rebuild images from scratch (--pull --no-cache)
       --no-build          use existing images, fail if missing
+  -d, --debug             also show progress, image builds and container setup
+                          (always saved under the output directory)
   -h, --help              show this help
 EOF
 }
 
-log() { printf '==> %s\n' "$*"; }
+DEBUG=0
+log() { if [ "$DEBUG" = 1 ]; then printf '==> %s\n' "$*"; fi; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 
@@ -52,7 +55,7 @@ detect_cuda() {
         fi
         return 1
     fi
-    nvidia-smi -L | sed 's/^/    /'
+    if [ "$DEBUG" = 1 ]; then nvidia-smi -L | sed 's/^/    /'; fi
 
     if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; then
         cuda_gpu_args=(--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all)
@@ -72,8 +75,8 @@ detect_cuda() {
 docker_gpu_args_cuda() { printf '%s\n' "${cuda_gpu_args[@]}"; }
 
 report_unsupported_gpus() {
-    pci_vendor_present 1002 && warn "AMD GPU found; no backend images for it yet"
-    pci_vendor_present 8086 && warn "Intel GPU found; no backend images for it yet"
+    pci_vendor_present 1002 && log "AMD GPU found; no backend images for it yet"
+    pci_vendor_present 8086 && log "Intel GPU found; no backend images for it yet"
     return 0
 }
 
@@ -94,6 +97,7 @@ while [ $# -gt 0 ]; do
         -g|--git) SOURCE_MODE=git; shift ;;
         --rebuild) build_mode=rebuild; shift ;;
         --no-build) build_mode=none; shift ;;
+        -d|--debug) DEBUG=1; shift ;;
         -h|--help) usage; exit 0 ;;
         --) shift; pytest_args=("$@"); break ;;
         *) usage >&2; die "unknown option: $1" ;;
@@ -130,11 +134,16 @@ trap '[ -n "$running_container" ] && docker kill "$running_container" >/dev/null
 trap 'exit 130' INT TERM
 
 run_logged() {
-    local tag=$1 logfile=$2
-    shift 2
+    local tag=$1 logfile=$2 show=$3 rc
+    shift 3
     set +e
-    "$@" 2>&1 | tee "$logfile" | sed -u "s/^/[$tag] /"
-    local rc=${PIPESTATUS[0]}
+    if [ "$show" = 1 ]; then
+        "$@" 2>&1 | tee "$logfile" | sed -u "s/^/[$tag] /"
+        rc=${PIPESTATUS[0]}
+    else
+        "$@" >"$logfile" 2>&1
+        rc=$?
+    fi
     set -e
     return "$rc"
 }
@@ -146,10 +155,10 @@ build_image() {
             docker image inspect "$image" >/dev/null 2>&1 || { echo "image $image missing" >"$logfile"; return 1; }
             ;;
         rebuild)
-            run_logged "$tag" "$logfile" docker build --pull --no-cache -t "$image" -f "$dockerfile" "$IMAGES_DIR"
+            run_logged "$tag" "$logfile" "$DEBUG" docker build --pull --no-cache -t "$image" -f "$dockerfile" "$IMAGES_DIR"
             ;;
         *)
-            run_logged "$tag" "$logfile" docker build -t "$image" -f "$dockerfile" "$IMAGES_DIR"
+            run_logged "$tag" "$logfile" "$DEBUG" docker build -t "$image" -f "$dockerfile" "$IMAGES_DIR"
             ;;
     esac
 }
@@ -185,6 +194,9 @@ for backend in "${backends[@]}"; do
 
         log "[$tag] building image $image"
         if ! build_image "$tag" "$image" "$dockerfile" "$result_dir/image-build.log"; then
+            if [ "$DEBUG" != 1 ]; then
+                tail -n 30 "$result_dir/image-build.log" | sed "s/^/[$tag] /" >&2
+            fi
             summary+=("$tag: IMAGE BUILD FAILED (see $result_dir/image-build.log)")
             failures=$((failures + 1))
             continue
@@ -193,6 +205,7 @@ for backend in "${backends[@]}"; do
         run_args=(--rm --init "${gpu_args[@]}"
             -e SOURCE_MODE="$SOURCE_MODE"
             -e PYTEST_ARGS="${pytest_args[*]}"
+            -e DEBUG="$DEBUG"
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)"
             -v "$result_dir:/results")
         if [ "$SOURCE_MODE" = local ]; then
@@ -206,7 +219,7 @@ for backend in "${backends[@]}"; do
         running_container="$IMAGE_PREFIX-$tag-$$"
         log "[$tag] running tests"
         start=$SECONDS
-        if run_logged "$tag" "$result_dir/run.log" docker run --name "$running_container" "${run_args[@]}" "$image"; then
+        if run_logged "$tag" "$result_dir/run.log" 1 docker run --name "$running_container" "${run_args[@]}" "$image"; then
             summary+=("$tag: PASSED ($((SECONDS - start))s)")
         else
             summary+=("$tag: FAILED ($((SECONDS - start))s, see $result_dir/run.log)")
@@ -216,6 +229,6 @@ for backend in "${backends[@]}"; do
     done
 done
 
-log "summary (results in $OUTPUT_DIR)"
+printf '==> summary (results in %s)\n' "$OUTPUT_DIR"
 printf '    %s\n' "${summary[@]}"
 [ "$failures" -eq 0 ]
