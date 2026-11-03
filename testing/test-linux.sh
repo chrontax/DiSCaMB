@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Runs the discamb test suite in docker containers: one container per
-# (linux system x GPU backend) pair, for every backend whose GPU is present on
-# this machine. Installs nothing on the host; requires docker and, for CUDA,
-# the NVIDIA driver plus NVIDIA Container Toolkit.
+# (linux system x backend) pair, for every backend usable on this machine: cpu
+# (native build) always, GPU backends (sycl build) when their GPU is present.
+# Installs nothing on the host; requires docker and, for CUDA, the NVIDIA
+# driver plus NVIDIA Container Toolkit.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 IMAGES_DIR="$SCRIPT_DIR/images"
 IMAGE_PREFIX=discamb-test
-SUPPORTED_BACKENDS=(cuda)
+SUPPORTED_BACKENDS=(cuda cpu)
 
 usage() {
     cat <<EOF
@@ -74,6 +75,9 @@ detect_cuda() {
 
 docker_gpu_args_cuda() { printf '%s\n' "${cuda_gpu_args[@]}"; }
 
+detect_cpu() { return 0; }
+docker_gpu_args_cpu() { :; }
+
 report_unsupported_gpus() {
     pci_vendor_present 1002 && log "AMD GPU found; no backend images for it yet"
     pci_vendor_present 8086 && log "Intel GPU found; no backend images for it yet"
@@ -125,7 +129,7 @@ for b in "${SUPPORTED_BACKENDS[@]}"; do
     fi
 done
 report_unsupported_gpus
-[ ${#backends[@]} -gt 0 ] || die "no usable GPU backend found"
+[ ${#backends[@]} -gt 0 ] || die "no usable backend found"
 
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)

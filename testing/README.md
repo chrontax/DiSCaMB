@@ -1,13 +1,23 @@
 # discamb testing engine
 
-End-to-end tests for the SYCL (GPU) build of discamb, run through pyDiSCaMB in
-docker containers.
+End-to-end tests for discamb, run through pyDiSCaMB in docker containers. The
+backend decides how pyDiSCaMB is built, once per image:
+
+- `cpu`: native build with the system compiler, no SYCL toolchain. Always
+  available, runs anywhere.
+- `cuda`: SYCL build with DPC++ for NVIDIA GPUs. It runs Engine4 (`CPU_v4`) on
+  the GPU and, from the same build, the CPU engines (`CPU` = Engine3), so CPU vs
+  GPU comparisons happen inside this container.
+
+Tests that need the SYCL build carry `@pytest.mark.sycl` and are skipped on
+`cpu`.
 
 ## Running (Linux)
 
 ```bash
 lib/discamb/testing/test-linux.sh                 # every detected backend x every system
 lib/discamb/testing/test-linux.sh -s ubuntu       # one system
+lib/discamb/testing/test-linux.sh -b cuda         # skip the cpu (native) build
 lib/discamb/testing/test-linux.sh -- -k memory    # extra pytest arguments
 lib/discamb/testing/test-linux.sh --git           # test git sources instead of the local tree
 lib/discamb/testing/test-linux.sh -d              # also show progress, image builds, setup
@@ -15,9 +25,9 @@ lib/discamb/testing/test-linux.sh -d              # also show progress, image bu
 
 By default the console shows only pytest output (one line per test, with what
 the test prints streamed live and every line prefixed with `[<test name>]`),
-errors and the final summary. Everything else is always saved: `image-build.log`, `setup.log`
-(source copy, environment builds, device check) and `run.log` per
-`<system>-<backend>`; `-d` prints it live as well.
+errors and the final summary. Everything else is always saved: `image-build.log`,
+`setup.log` (source copy, build, device check), `build.log` (pip/CMake output)
+and `run.log` per `<system>-<backend>`; `-d` prints it live as well.
 
 Host requirements: docker, plus for the `cuda` backend the NVIDIA driver and
 NVIDIA Container Toolkit registered with docker, either as the `nvidia` runtime
@@ -36,20 +46,20 @@ logs and `junit.xml` land in `testing/results/<timestamp>/<system>-<backend>/`.
 
 ## Layout
 
-- `test-linux.sh` detects GPU backends and runs one container per
+- `test-linux.sh` detects the usable backends and runs one container per
   `images/<system>-<backend>` image.
-- `images/<system>-<backend>/Dockerfile` holds the system packages and CUDA base
-  image. Build args: `CUDA_VERSION` (default 12.9.2), `DPCPP_VERSION` (default v6.3.0).
-- `images/common/provision.sh` installs micromamba, the DPC++ release and the
-  `discamb-cpu` / `discamb-sycl` environments (`environment.yml`) at image build time.
+- `images/<system>-<backend>/Dockerfile` holds the system packages and base
+  image and sets `TEST_BACKEND` and `BUILD_KIND` (`native` or `sycl`). cuda
+  build args: `CUDA_VERSION` (default 12.9.2), `DPCPP_VERSION` (default v6.3.0).
+- `images/common/provision.sh` installs micromamba, for sycl images the DPC++
+  release, and the `discamb` environment (`environment.yml`) at image build time.
 - `images/common/run-tests.sh` is the container entrypoint. It builds pyDiSCaMB
-  into both environments (CPU with the system compiler, SYCL with DPC++),
-  checks that the SYCL runtime sees a backend device, then runs pytest over
-  `tests/` in the sycl environment.
-- `images/common/env-exec <cpu|sycl> cmd...` runs a command in one environment.
-- `tests/conftest.py` provides fixtures for tests: `run_in_env(env, script)`
-  runs Python in the `cpu` or `sycl` environment (timed); also `backend`,
-  `system`, `results_dir`, `source_dir`.
+  once according to `BUILD_KIND`, checks that it imports and (sycl) that the
+  SYCL runtime sees a backend device, then runs pytest over `tests/`.
+- `images/common/env-exec cmd...` runs a command in the `discamb` environment.
+- `tests/conftest.py` provides fixtures for tests: `run_in_env(script)` runs
+  Python in the test environment (timed); also `backend`, `build`, `system`,
+  `results_dir`, `source_dir`, and the `sycl` marker.
 - `tests/tools.py` holds diagnostics importable from tests. `GpuMemoryProfiler`
   samples GPU memory every 10 ms with the vendor tool of the detected backend
   (`cuda` -> `nvidia-smi --query-gpu=memory.used --loop-ms=10`):
@@ -59,7 +69,7 @@ logs and `junit.xml` land in `testing/results/<timestamp>/<system>-<backend>/`.
 
   profiler = GpuMemoryProfiler()
   profiler.start()
-  run_in_env("sycl", script)
+  run_in_env(script)
   profile = profiler.stop()
   assert profile.peak_above_baseline_mib < 2048  # also .peak_mib, .mean_mib
   ```
@@ -76,6 +86,6 @@ logs and `junit.xml` land in `testing/results/<timestamp>/<system>-<backend>/`.
 Add `detect_<backend>` and `docker_gpu_args_<backend>` to `test-linux.sh`,
 append the backend to `SUPPORTED_BACKENDS`, and add
 `images/<system>-<backend>/Dockerfile` setting `TEST_BACKEND` (the SYCL
-`ONEAPI_DEVICE_SELECTOR` backend name) and `SYCL_TARGETS`. For memory
+`ONEAPI_DEVICE_SELECTOR` backend name), `BUILD_KIND=sycl` and `SYCL_TARGETS`. For memory
 profiling, add a `_MemorySampler` subclass to `tests/tools.py` (backend name,
 vendor tool, command, line parser) and list it in `SAMPLERS`.

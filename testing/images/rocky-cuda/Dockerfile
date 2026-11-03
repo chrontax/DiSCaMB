@@ -8,6 +8,7 @@ ENV MAMBA_ROOT_PREFIX=/opt/micromamba \
     DPCPP_VERSION=${DPCPP_VERSION} \
     TEST_SYSTEM=rocky \
     TEST_BACKEND=cuda \
+    BUILD_KIND=sycl \
     SYCL_TARGETS=nvptx64-nvidia-cuda \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
@@ -15,7 +16,7 @@ RUN dnf install -y --allowerasing \
         gcc gcc-c++ make git curl ca-certificates bzip2 tar findutils \
     && dnf clean all
 
-# Heavy, rarely changing layer: micromamba, DPC++ and both environments.
+# Heavy, rarely changing layer: micromamba, DPC++ and the environment.
 COPY common/provision.sh common/environment.yml /opt/discamb-testing/
 RUN /opt/discamb-testing/provision.sh
 

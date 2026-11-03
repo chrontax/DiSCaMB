@@ -9,6 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DPCPP_VERSION=${DPCPP_VERSION} \
     TEST_SYSTEM=ubuntu \
     TEST_BACKEND=cuda \
+    BUILD_KIND=sycl \
     SYCL_TARGETS=nvptx64-nvidia-cuda \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
@@ -17,7 +18,7 @@ RUN apt-get update \
         build-essential git curl ca-certificates bzip2 tar \
     && rm -rf /var/lib/apt/lists/*
 
-# Heavy, rarely changing layer: micromamba, DPC++ and both environments.
+# Heavy, rarely changing layer: micromamba, DPC++ and the environment.
 COPY common/provision.sh common/environment.yml /opt/discamb-testing/
 RUN /opt/discamb-testing/provision.sh
 

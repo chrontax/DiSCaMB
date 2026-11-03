@@ -1,8 +1,9 @@
 """Shared fixtures for discamb container tests.
 
-Tests run under pytest in the discamb-sycl environment. ``run_in_env`` executes
-Python code in either environment ("cpu" or "sycl"), which is how a test
-compares the SYCL build against its CPU counterpart.
+Each image builds pyDiSCaMB once: natively for the cpu backend, with SYCL for
+GPU backends. ``run_in_env`` runs Python in that build; a SYCL build also runs
+the CPU engines, which is how a test compares Engine4 with Engine3. Tests that
+need the SYCL build are marked ``@pytest.mark.sycl`` and skipped elsewhere.
 """
 
 import os
@@ -15,16 +16,27 @@ from typing import Optional, Sequence, Union
 
 import pytest
 
-ENVS = ("cpu", "sycl")
-
 
 @dataclass(frozen=True)
 class EnvRun:
-    env: str
     returncode: int
     stdout: str
     stderr: str
     wall_time_s: float
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "sycl: needs pyDiSCaMB built with SYCL (a GPU backend)")
+
+
+def pytest_collection_modifyitems(config, items):
+    build = os.environ.get("DISCAMB_TEST_BUILD")
+    if build == "sycl":
+        return
+    skip = pytest.mark.skip(reason=f"needs the sycl build, this image has {build!r}")
+    for item in items:
+        if "sycl" in item.keywords:
+            item.add_marker(skip)
 
 
 class _LabeledStream:
@@ -73,6 +85,11 @@ def backend() -> str:
 
 
 @pytest.fixture(scope="session")
+def build() -> str:
+    return _setting("DISCAMB_TEST_BUILD")
+
+
+@pytest.fixture(scope="session")
 def system() -> str:
     return _setting("DISCAMB_TEST_SYSTEM")
 
@@ -89,32 +106,29 @@ def source_dir() -> Path:
 
 @pytest.fixture(scope="session")
 def run_in_env():
-    """Return ``run(env, script, args=(), timeout=None, check=True) -> EnvRun``.
+    """Return ``run(script, args=(), timeout=None, check=True) -> EnvRun``.
 
     ``script`` is a path to a Python file or a string of Python code.
     """
     env_exec = _setting("DISCAMB_TEST_ENV_EXEC")
 
     def run(
-        env: str,
         script: Union[str, Path],
         args: Sequence[str] = (),
         timeout: Optional[float] = None,
         check: bool = True,
     ) -> EnvRun:
-        if env not in ENVS:
-            raise ValueError(f"unknown env {env!r}, expected one of {ENVS}")
         target = [str(script)] if isinstance(script, Path) else ["-c", script]
         start = time.perf_counter()
         proc = subprocess.run(
-            [env_exec, env, "python", *target, *args],
+            [env_exec, "python", *target, *args],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
-        result = EnvRun(env, proc.returncode, proc.stdout, proc.stderr, time.perf_counter() - start)
+        result = EnvRun(proc.returncode, proc.stdout, proc.stderr, time.perf_counter() - start)
         if check and proc.returncode != 0:
-            pytest.fail(f"[{env}] exited with {proc.returncode}:\n{proc.stderr}")
+            pytest.fail(f"workload exited with {proc.returncode}:\n{proc.stderr}")
         return result
 
     return run

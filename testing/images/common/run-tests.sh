@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Container entrypoint: prepares the pyDiSCaMB source, builds it into the
-# discamb-cpu (system compiler) and discamb-sycl (DPC++) environments, checks
-# that both import and that the SYCL runtime sees a $TEST_BACKEND device, then
-# runs pytest over lib/discamb/testing/tests inside the sycl environment.
+# discamb environment (BUILD_KIND=native: system compiler; sycl: DPC++ for
+# $SYCL_TARGETS), checks that it imports and, for sycl, that the SYCL runtime
+# sees a $TEST_BACKEND device, then runs pytest over lib/discamb/testing/tests.
 #
 # Inputs (environment):
 #   SOURCE_MODE    local (default): copy the pyDiSCaMB tree mounted at /src
@@ -23,6 +23,7 @@ PYTEST_ARGS=${PYTEST_ARGS:-}
 DEBUG=${DEBUG:-0}
 
 ENV_EXEC=/opt/discamb-testing/env-exec
+ENV_PREFIX="$MAMBA_ROOT_PREFIX/envs/discamb"
 SRC=/work/src
 BUILD=/work/build
 RESULTS=/results
@@ -81,15 +82,13 @@ prepare_source() {
         || die "lib/discamb has no SYCL build option; is it the chrontax/DiSCaMB fork?"
 }
 
-build_env() {
-    local kind=$1
-    local prefix="$MAMBA_ROOT_PREFIX/envs/discamb-$kind"
-    local logfile="$RESULTS/build-$kind.log"
-    local -a args=(-v "$SRC" -C "build-dir=$BUILD/$kind"
+build_discamb() {
+    local logfile="$RESULTS/build.log"
+    local -a args=(-v "$SRC" -C "build-dir=$BUILD"
         -C "cmake.define.DISCAMB_BUILD_TESTS=OFF")
     local -a extra_env=()
 
-    if [ "$kind" = sycl ]; then
+    if [ "$BUILD_KIND" = sycl ]; then
         args+=(
             -C "cmake.define.CMAKE_CXX_COMPILER=$DPCPP_ROOT/bin/clang++"
             -C "cmake.define.SYCL=ON"
@@ -97,31 +96,28 @@ build_env() {
             -C "cmake.define.SYCL_INCLUDE_DIR=$DPCPP_ROOT/include"
             -C "cmake.define.SYCL_LIBRARY_DIR=$DPCPP_ROOT/lib"
             -C "cmake.define.SYCL_TARGETS=$SYCL_TARGETS"
-            -C "cmake.define.CMAKE_CXX_FLAGS=-I$prefix/include"
+            -C "cmake.define.CMAKE_CXX_FLAGS=-I$ENV_PREFIX/include"
         )
         # clang links libomp from the env; it is not on the system linker path.
-        extra_env=(LIBRARY_PATH="$prefix/lib")
+        extra_env=(LIBRARY_PATH="$ENV_PREFIX/lib")
     fi
 
-    log "building pyDiSCaMB in discamb-$kind (log: $(basename "$logfile"))"
+    log "building pyDiSCaMB ($BUILD_KIND) (log: $(basename "$logfile"))"
     local start=$SECONDS
-    if ! env "${extra_env[@]}" "$ENV_EXEC" "$kind" python -m pip install "${args[@]}" >"$logfile" 2>&1; then
+    if ! env "${extra_env[@]}" "$ENV_EXEC" python -m pip install "${args[@]}" >"$logfile" 2>&1; then
         tail -n 60 "$logfile" >&2
-        die "discamb-$kind build failed"
+        die "pyDiSCaMB ($BUILD_KIND) build failed"
     fi
-    log "discamb-$kind built in $((SECONDS - start))s"
+    log "pyDiSCaMB ($BUILD_KIND) built in $((SECONDS - start))s"
 }
 
-check_envs() {
-    local kind
-    for kind in cpu sycl; do
-        "$ENV_EXEC" "$kind" python -c 'import pydiscamb' \
-            || die "pydiscamb does not import in discamb-$kind"
-    done
-    log "pydiscamb imports in discamb-cpu and discamb-sycl"
+check_build() {
+    "$ENV_EXEC" python -c 'import pydiscamb' || die "pydiscamb does not import"
+    log "pydiscamb imports"
+    [ "$BUILD_KIND" = sycl ] || return 0
 
     local devices
-    devices=$("$ENV_EXEC" sycl "$DPCPP_ROOT/bin/sycl-ls" 2>&1) \
+    devices=$("$ENV_EXEC" "$DPCPP_ROOT/bin/sycl-ls" 2>&1) \
         || die "sycl-ls failed: $devices"
     log "sycl-ls:"$'\n'"$devices"
     grep -q "^\[$TEST_BACKEND:" <<<"$devices" \
@@ -135,6 +131,7 @@ run_tests() {
     export DISCAMB_TEST_ENV_EXEC="$ENV_EXEC"
     export DISCAMB_TEST_SYSTEM="$TEST_SYSTEM"
     export DISCAMB_TEST_BACKEND="$TEST_BACKEND"
+    export DISCAMB_TEST_BUILD="$BUILD_KIND"
     export DISCAMB_TEST_RESULTS="$RESULTS"
     export DISCAMB_TEST_SOURCE="$SRC"
 
@@ -143,7 +140,7 @@ run_tests() {
 
     log "running pytest in $tests_dir"
     local rc=0
-    (cd "$tests_dir" && "$ENV_EXEC" sycl python -m pytest -v -s -p no:cacheprovider -rA \
+    (cd "$tests_dir" && "$ENV_EXEC" python -m pytest -v -s -p no:cacheprovider -rA \
         --junitxml="$RESULTS/junit.xml" "${extra[@]}" .) || rc=$?
     # pytest exit code 5 means no tests were collected.
     if [ "$rc" -eq 5 ]; then
@@ -154,10 +151,9 @@ run_tests() {
 }
 
 mkdir -p "$RESULTS"
-log "DPC++ $DPCPP_VERSION, source mode: $SOURCE_MODE"
+log "build: $BUILD_KIND${DPCPP_VERSION:+ (DPC++ $DPCPP_VERSION)}, source mode: $SOURCE_MODE"
 prepare_source
-build_env cpu
-build_env sycl
-check_envs
+build_discamb
+check_build
 run_tests
 log "all tests passed"

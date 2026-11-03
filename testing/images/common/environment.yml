@@ -1,5 +1,5 @@
-# Dependencies shared by both test environments (discamb-cpu and discamb-sycl).
-# The environments differ only in how pyDiSCaMB is built into them.
+# Dependencies of the test environment `discamb`, the same for every image;
+# images differ only in how pyDiSCaMB is built into it (BUILD_KIND).
 channels:
   - conda-forge
 dependencies:
