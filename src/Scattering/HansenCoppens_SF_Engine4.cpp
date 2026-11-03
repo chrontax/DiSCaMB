@@ -1633,6 +1633,10 @@ void HansenCoppens_SF_Engine4::calculateSF(
     }
     printStep("rotating Us");
 
+#ifndef SYCL
+    // the SYCL kernel evaluates phase and temperature factors directly per hkl,
+    // so these per-bin tables are only built for the OpenMP path
+
     // [bin][atom][symOpMult | 1]
     std::vector<std::vector<std::vector<REAL>>> temperatureFactorRoots;
     temperatureFactorRoots.resize(binCount);
@@ -2083,6 +2087,7 @@ void HansenCoppens_SF_Engine4::calculateSF(
     }
 
     printStep("virtual hkl temperature multipliers");
+#endif
 
     std::vector<int> usedWfns;
     usedWfns.clear();
@@ -2298,7 +2303,6 @@ void HansenCoppens_SF_Engine4::calculateSF(
     sycl::range<1> job_num(hklCount);
 
     vector_of_Vector3_to_buffer(int, hkl_indices, hkl);
-    vector_of_Vector3_to_buffer(int, usedBins, used_bins);
 
     sycl::buffer<std::complex<REAL>> f_buf(hklCount);
     sycl::buffer<REAL, 2> f_core_buf(sycl::range(hklCount, wfnCount));
@@ -2323,20 +2327,12 @@ void HansenCoppens_SF_Engine4::calculateSF(
     sycl::buffer<int> used_types_buf(usedTypes);
     sycl::buffer<int> atom_to_wfn_map_buf(atom_to_wfn_map);
     sycl::buffer<int> atom_to_type_map_buf(atom_to_type_map);
-    sycl::buffer<int> all_bins_map_buf(allBinsMap);
     sycl::buffer<int> sym_op_to_mult_buf(symOpToMult);
+    sycl::buffer<int> sym_op_to_offset_buf(symOpToOffset);
 
     std::vector<std::vector<std::vector<REAL>>> type_p_lm_vec;
     for (auto &type : typeParams) type_p_lm_vec.push_back(type.p_lm);
     vecnd_to_buffers(type_p_lm_vec, type_p_lm);
-
-    vecnd_to_buffers(temperatureFactorMultsSquare[0],
-                     temperature_factor_mults_square0);
-    vecnd_to_buffers(temperatureFactorMultsSquare[1],
-                     temperature_factor_mults_square1);
-    vecnd_to_buffers(temperatureFactorMultsSquare[2],
-                     temperature_factor_mults_square2);
-    vecnd_to_buffers(virtHklTMul, virt_hkl_t_mul);
 
     vecvec_to_buffers(atomic_displacement_parameters,
                       atomic_displacement_parameters);
@@ -2351,36 +2347,42 @@ void HansenCoppens_SF_Engine4::calculateSF(
     vec_of_matrix_to_column_buffers(local_coordinate_systems,
                                     local_coordinate_systems);
 
-    vecnd_to_buffers(temperatureFactorRoots, temperature_factor_roots);
+    // [atom][symOpMult][xyz]
+    auto r_atom_rot_buf = [&]() {
+        std::vector<REAL> values;
+        values.reserve(size_t(nAtoms) * symOpMultCount * 3);
+        for (const auto &perAtom : r_atom_rot)
+            for (const auto &r : perAtom)
+                for (int k = 0; k < 3; ++k) values.push_back(r[k]);
+        return sycl::buffer<REAL>(values.begin(), values.end());
+    }();
 
-    std::vector<std::vector<std::vector<sycl::vec<REAL, 3>>>>
-        per_bin_temperature_factor_mult_sycl;
-    for (auto &vec1 : perBinTemperatureFactorMult) {
-        std::vector<std::vector<sycl::vec<REAL, 3>>> tmp1;
-        for (auto &vec2 : vec1) {
-            std::vector<sycl::vec<REAL, 3>> tmp2;
-            for (auto el : vec2) tmp2.push_back(Vector3_to_vec(REAL, el));
-            tmp1.push_back(tmp2);
+    // [symOpOffset][xyz]
+    auto sym_op_offsets_buf = [&]() {
+        std::vector<REAL> values;
+        values.reserve(size_t(symOpOffsetCount) * 3);
+        for (const auto &t : symOpOffsets)
+            for (int k = 0; k < 3; ++k) values.push_back(t[k]);
+        return sycl::buffer<REAL>(values.begin(), values.end());
+    }();
+
+    // [atom][symOpMult][U00, U11, U22, U01, U02, U12], zero for iso atoms
+    auto rotated_us_buf = [&]() {
+        std::vector<REAL> values(size_t(nAtoms) * symOpMultCount * 6, 0.0);
+        for (int atom = 0; atom < nAtoms; ++atom) {
+            for (int m = 0; m < (int)rotatedUs[atom].size(); ++m) {
+                const auto &u = rotatedUs[atom][m];
+                REAL *dst = &values[(size_t(atom) * symOpMultCount + m) * 6];
+                dst[0] = u(0, 0);
+                dst[1] = u(1, 1);
+                dst[2] = u(2, 2);
+                dst[3] = u(0, 1);
+                dst[4] = u(0, 2);
+                dst[5] = u(1, 2);
+            }
         }
-        per_bin_temperature_factor_mult_sycl.push_back(tmp1);
-    }
-    vecnd_to_buffers(per_bin_temperature_factor_mult_sycl,
-                     per_bin_temperature_factor_mult);
-
-    vecnd_to_buffers(temperatureFactorMults[0], temperature_factor_mults0);
-    vecnd_to_buffers(temperatureFactorMults[1], temperature_factor_mults1);
-    vecnd_to_buffers(temperatureFactorMults[2], temperature_factor_mults2);
-    vecnd_to_buffers(phaseFactorMults[0], phase_factor_mults0);
-    vecnd_to_buffers(phaseFactorMults[1], phase_factor_mults1);
-    vecnd_to_buffers(phaseFactorMults[2], phase_factor_mults2);
-
-    vecnd_to_buffers(phaseFactorRoots, phase_factor_roots);
-    vecnd_to_buffers(virtHklTemperature, virt_hkl_temperature);
-    vecnd_to_buffers(virtHklPhase, virt_hkl_phase);
-
-    sycl::vec<int, 3> s_min_hkl = Vector3_to_vec(int, minHkl);
-    sycl::vec<int, 3> s_step = Vector3_to_vec(int, step);
-    sycl::vec<int, 3> s_n_bins = Vector3_to_vec(int, nBins);
+        return sycl::buffer<REAL>(values.begin(), values.end());
+    }();
 
     Matrix3d f2c = recUnitCell.getFractionalToCartesianMatrix();
     sycl::vec<REAL, 3> f2c_0;
@@ -2510,7 +2512,6 @@ void HansenCoppens_SF_Engine4::calculateSF(
         sycl::accessor sym_op_f_mult_ax(
             sym_op_f_mult_buf, cgh, sycl::read_write);
         sycl::accessor hkl_ax(hkl_buf, cgh, sycl::read_only);
-        sycl::accessor used_bins_ax(used_bins_buf, cgh, sycl::read_only);
         sycl::accessor used_wfn_type_combo_ax(
             used_wfn_type_combo_buf, cgh, sycl::read_only);
         sycl::accessor type_kappa_spherical_ax(
@@ -2552,9 +2553,14 @@ void HansenCoppens_SF_Engine4::calculateSF(
             local_coordinate_systems_column1_buf, cgh, sycl::read_only);
         sycl::accessor local_coordinate_systems_column2_ax(
             local_coordinate_systems_column2_buf, cgh, sycl::read_only);
-        sycl::accessor all_bins_map_ax(all_bins_map_buf, cgh, sycl::read_only);
         sycl::accessor sym_op_to_mult_ax(
             sym_op_to_mult_buf, cgh, sycl::read_only);
+        sycl::accessor sym_op_to_offset_ax(
+            sym_op_to_offset_buf, cgh, sycl::read_only);
+        sycl::accessor r_atom_rot_ax(r_atom_rot_buf, cgh, sycl::read_only);
+        sycl::accessor sym_op_offsets_ax(
+            sym_op_offsets_buf, cgh, sycl::read_only);
+        sycl::accessor rotated_us_ax(rotated_us_buf, cgh, sycl::read_only);
         sycl::accessor type_p_lm_sizes_ax(
             type_p_lm_sizes_buf, cgh, sycl::read_only);
         sycl::accessor anomalous_scattering_ax(
@@ -2569,22 +2575,7 @@ void HansenCoppens_SF_Engine4::calculateSF(
         sycl::accessor anomalous_dispersion_ax(
             anomalous_dispersion_buf, cgh, sycl::read_only);
 
-        vecnd_buffer_accessors(temperature_factor_roots);
-        vecnd_buffer_accessors(per_bin_temperature_factor_mult);
-        vecnd_buffer_accessors(temperature_factor_mults0);
-        vecnd_buffer_accessors(temperature_factor_mults1);
-        vecnd_buffer_accessors(temperature_factor_mults2);
-        vecnd_buffer_accessors(phase_factor_mults0);
-        vecnd_buffer_accessors(phase_factor_mults1);
-        vecnd_buffer_accessors(phase_factor_mults2);
-        vecnd_buffer_accessors(phase_factor_roots);
-        vecnd_buffer_accessors(virt_hkl_temperature);
-        vecnd_buffer_accessors(virt_hkl_phase);
         vecnd_buffer_accessors(type_p_lm);
-        vecnd_buffer_accessors(temperature_factor_mults_square0);
-        vecnd_buffer_accessors(temperature_factor_mults_square1);
-        vecnd_buffer_accessors(temperature_factor_mults_square2);
-        vecnd_buffer_accessors(virt_hkl_t_mul);
 
         // Wfn params
         sycl::accessor wfn_param_metas_ax(
@@ -2604,22 +2595,7 @@ void HansenCoppens_SF_Engine4::calculateSF(
 
             sycl::vec<int, 3> hkl = hkl_ax[id];
 
-            sycl::vec<int, 3> orig_bin;
-            for (int i = 0; i < 3; i++)
-                orig_bin[i] =
-                    (hkl[i] - s_min_hkl[i]) / (s_step[i] * binSize[i]);
-
-            int binIdx =
-                all_bins_map_ax[(orig_bin[0] * s_n_bins[1] + orig_bin[1]) *
-                                    s_n_bins[2] +
-                                orig_bin[2]];
-
             std::complex<REAL> f_acc = 0;
-
-            sycl::vec<int, 3> offset;
-            for (int i = 0; i < 3; i++)
-                offset[i] = ((hkl[i] - s_min_hkl[i]) / s_step[i]) -
-                            (used_bins_ax[binIdx][i] * binSize[i]);
 
             sycl::vec<REAL, 3> cartesian_h(0);
             sycl::vec<REAL, 3> hkl_real{hkl[0], hkl[1], hkl[2]};
@@ -2630,9 +2606,10 @@ void HansenCoppens_SF_Engine4::calculateSF(
             tmp = f2c_2 * hkl_real;
             cartesian_h[2] = tmp[0] + tmp[1] + tmp[2];
 
-            REAL h_length = sycl::sqrt(cartesian_h[0] * cartesian_h[0] +
-                                       cartesian_h[1] * cartesian_h[1] +
-                                       cartesian_h[2] * cartesian_h[2]);
+            const REAL h_length_sq = cartesian_h[0] * cartesian_h[0] +
+                                     cartesian_h[1] * cartesian_h[1] +
+                                     cartesian_h[2] * cartesian_h[2];
+            REAL h_length = sycl::sqrt(h_length_sq);
 
             auto f_core = f_core_ax[id];
 
@@ -2682,45 +2659,22 @@ void HansenCoppens_SF_Engine4::calculateSF(
                                               ? sycl::vec<REAL, 3>{0}
                                               : cartesian_h / h_length;
 
-            int virtHklPhaseCurrent;
-            if constexpr (virtHklPhaseFlag)
-                virtHklPhaseCurrent =
-                    (offset[0] * binSize[1] + offset[1]) * binSize[2] +
-                    offset[2];
-
-            int virtHklTemperatureCurrent;
-            if constexpr (virtHklTemperatureFlag)
-                virtHklTemperatureCurrent =
-                    (offset[0] * binSize[1] + offset[1]) * binSize[2] +
-                    offset[2];
-
             for (int atom_i = 0; atom_i < nAtoms; ++atom_i) {
                 std::complex<REAL> perAtomF = 0.0;
                 auto symOpFMult = sym_op_f_mult_ax[id];
                 for (int i = 0; i < symOpMultCount; ++i) symOpFMult[i] = 0;
                 for (int symOpIdx = 0; symOpIdx < nSymOps; symOpIdx++) {
-                    std::complex<REAL> localF = index_vecnd_buffer(
-                        phase_factor_roots, binIdx, atom_i, symOpIdx);
-                    if constexpr (virtHklPhaseFlag) {
-                        localF *= index_vecnd_buffer(virt_hkl_phase,
-                                                     virtHklPhaseCurrent,
-                                                     atom_i,
-                                                     symOpIdx);
-                    } else {
-                        localF *= index_vecnd_buffer(phase_factor_mults0,
-                                                     atom_i,
-                                                     symOpIdx,
-                                                     offset[0]) *
-                                  index_vecnd_buffer(phase_factor_mults1,
-                                                     atom_i,
-                                                     symOpIdx,
-                                                     offset[1]) *
-                                  index_vecnd_buffer(phase_factor_mults2,
-                                                     atom_i,
-                                                     symOpIdx,
-                                                     offset[2]);
-                    }
-                    symOpFMult[sym_op_to_mult_ax[symOpIdx]] += localF;
+                    const int mult = sym_op_to_mult_ax[symOpIdx];
+                    const int r_off = (atom_i * symOpMultCount + mult) * 3;
+                    const int t_off = sym_op_to_offset_ax[symOpIdx] * 3;
+                    REAL phase_angle = 0.0;
+                    for (int k = 0; k < 3; k++)
+                        phase_angle += (r_atom_rot_ax[r_off + k] +
+                                        sym_op_offsets_ax[t_off + k]) *
+                                       cartesian_h[k];
+                    phase_angle *= two_pi;
+                    symOpFMult[mult] += std::complex<REAL>(
+                        sycl::cos(phase_angle), sycl::sin(phase_angle));
                 }
 
                 bool iso = (used_atom_indices_ax[atom_i] + 1 ==
@@ -2743,63 +2697,32 @@ void HansenCoppens_SF_Engine4::calculateSF(
                 std::array<std::complex<REAL>, 6> d_adp_p;
                 std::array<std::complex<REAL>, 3> d_xyz_p;
 
-                for (int symOpIdx = 0; symOpIdx < symOpMultCount; symOpIdx++) {
-                    REAL localF = index_vecnd_buffer(temperature_factor_roots,
-                                                     binIdx,
-                                                     atom_i,
-                                                     iso ? 0 : symOpIdx);
-                    if constexpr (virtHklTemperatureFlag) {
-                        localF *= index_vecnd_buffer(virt_hkl_temperature,
-                                                     virtHklTemperatureCurrent,
-                                                     atom_i,
-                                                     iso ? 0 : symOpIdx);
-                    } else {
-                        localF *=
-                            index_vecnd_buffer(temperature_factor_mults0,
-                                               atom_i,
-                                               iso ? 0 : symOpIdx,
-                                               offset[0]) *
-                            index_vecnd_buffer(temperature_factor_mults1,
-                                               atom_i,
-                                               iso ? 0 : symOpIdx,
-                                               offset[1]) *
-                            index_vecnd_buffer(temperature_factor_mults2,
-                                               atom_i,
-                                               iso ? 0 : symOpIdx,
-                                               offset[2]) *
-                            index_vecnd_buffer(temperature_factor_mults_square0,
-                                               atom_i,
-                                               iso ? 0 : symOpIdx,
-                                               offset[1],
-                                               offset[2]) *
-                            index_vecnd_buffer(temperature_factor_mults_square1,
-                                               atom_i,
-                                               iso ? 0 : symOpIdx,
-                                               offset[2],
-                                               offset[0]) *
-                            index_vecnd_buffer(temperature_factor_mults_square2,
-                                               atom_i,
-                                               iso ? 0 : symOpIdx,
-                                               offset[0],
-                                               offset[1]);
-                    }
+                const REAL iso_temperature_factor =
+                    iso ? sycl::exp(
+                              -atomic_displacement_parameters_value_ax
+                                  [atomic_displacement_parameters_offset_ax
+                                       [used_atom_indices_ax[atom_i]]] *
+                              h_length_sq)
+                        : 0.0;
 
-                    for (int i = 0; i < 3; i++) {
-                        if constexpr (virtHklTMulFlag)
-                            localF *= index_vecnd_buffer(virt_hkl_t_mul,
-                                                         binIdx,
-                                                         i,
-                                                         offset[i],
-                                                         atom_i,
-                                                         iso ? 0 : symOpIdx);
-                        else
-                            localF *=
-                                sycl::pow(index_vecnd_buffer(
-                                              per_bin_temperature_factor_mult,
-                                              binIdx,
-                                              atom_i,
-                                              iso ? 0 : symOpIdx)[i],
-                                          offset[i]);
+                for (int symOpIdx = 0; symOpIdx < symOpMultCount; symOpIdx++) {
+                    REAL localF = iso_temperature_factor;
+                    if (not iso) {
+                        const int u_off =
+                            (atom_i * symOpMultCount + symOpIdx) * 6;
+                        localF =
+                            sycl::exp(-(cartesian_h[0] * cartesian_h[0] *
+                                            rotated_us_ax[u_off + 0] +
+                                        cartesian_h[1] * cartesian_h[1] *
+                                            rotated_us_ax[u_off + 1] +
+                                        cartesian_h[2] * cartesian_h[2] *
+                                            rotated_us_ax[u_off + 2] +
+                                        2.0 * (cartesian_h[0] * cartesian_h[1] *
+                                                   rotated_us_ax[u_off + 3] +
+                                               cartesian_h[0] * cartesian_h[2] *
+                                                   rotated_us_ax[u_off + 4] +
+                                               cartesian_h[1] * cartesian_h[2] *
+                                                   rotated_us_ax[u_off + 5])));
                     }
 
                     const auto type_i =
