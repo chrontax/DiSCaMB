@@ -38,6 +38,7 @@ def _save(report, results_dir):
 
 
 @pytest.mark.sycl
+@pytest.mark.usefixtures("sycl_warmup")
 def test_6ipu_sycl_resources(run_in_env, source_dir, results_dir, backend, build):
     profiler = GpuMemoryProfiler()
     profiler.start()
