@@ -24,8 +24,6 @@ Options:
   -o, --output-dir DIR    where logs and results go (default: testing/results/<timestamp>)
   -g, --git               test sources cloned from git instead of the local tree;
                           honours PYDISCAMB_REPO, PYDISCAMB_REF, DISCAMB_REPO, DISCAMB_REF
-      --rebuild           rebuild images from scratch (--pull --no-cache)
-      --no-build          use existing images, fail if missing
   -d, --debug             also show progress, image builds and container setup
                           (always saved under the output directory)
   -h, --help              show this help
@@ -89,7 +87,6 @@ backends_arg=""
 PYDISCAMB_DIR="$SCRIPT_DIR/../../.."
 OUTPUT_DIR="$SCRIPT_DIR/results/$(date +%Y%m%d-%H%M%S)"
 SOURCE_MODE=local
-build_mode=normal
 pytest_args=()
 
 while [ $# -gt 0 ]; do
@@ -99,8 +96,6 @@ while [ $# -gt 0 ]; do
         -p|--pydiscamb-dir) PYDISCAMB_DIR=${2:?}; shift 2 ;;
         -o|--output-dir) OUTPUT_DIR=${2:?}; shift 2 ;;
         -g|--git) SOURCE_MODE=git; shift ;;
-        --rebuild) build_mode=rebuild; shift ;;
-        --no-build) build_mode=none; shift ;;
         -d|--debug) DEBUG=1; shift ;;
         -h|--help) usage; exit 0 ;;
         --) shift; pytest_args=("$@"); break ;;
@@ -154,17 +149,7 @@ run_logged() {
 
 build_image() {
     local tag=$1 image=$2 dockerfile=$3 logfile=$4
-    case "$build_mode" in
-        none)
-            docker image inspect "$image" >/dev/null 2>&1 || { echo "image $image missing" >"$logfile"; return 1; }
-            ;;
-        rebuild)
-            run_logged "$tag" "$logfile" "$DEBUG" docker build --pull --no-cache -t "$image" -f "$dockerfile" "$IMAGES_DIR"
-            ;;
-        *)
-            run_logged "$tag" "$logfile" "$DEBUG" docker build -t "$image" -f "$dockerfile" "$IMAGES_DIR"
-            ;;
-    esac
+    run_logged "$tag" "$logfile" "$DEBUG" docker build -t "$image" -f "$dockerfile" "$IMAGES_DIR"
 }
 
 declare -a summary=()
