@@ -27,6 +27,8 @@
 
 #ifdef SYCL
 #include <sycl/sycl.hpp>
+#include <tuple>
+#include <utility>
 
 #include "sycl/access/access.hpp"
 #include "sycl/accessor.hpp"
@@ -146,15 +148,25 @@ inline int index_flat(const OffsetAccessor &offsets_ax,
     using buf_name_prefix##_list_type = std::decay_t<decltype(list)>;        \
     constexpr std::size_t buf_name_prefix##_depth =                          \
         vecnd_detail::list_depth<buf_name_prefix##_list_type>::value;        \
-    auto buf_name_prefix##_value_vec = vecnd_detail::flatten_all(list);      \
-    sycl::buffer<typename vecnd_detail::deepest_value_type<                  \
-        buf_name_prefix##_list_type>::type>                                  \
-        buf_name_prefix##_value_buf(buf_name_prefix##_value_vec);            \
-    auto buf_name_prefix##_offsets_data = vecnd_detail::build_offsets(list); \
-    auto buf_name_prefix##_level_offsets =                                   \
-        buf_name_prefix##_offsets_data.level_offsets;                        \
-    sycl::buffer<int> buf_name_prefix##_offsets_buf(                         \
-        buf_name_prefix##_offsets_data.flat);
+    auto buf_name_prefix##_value_buf = [&]() {                               \
+        using value_type = typename vecnd_detail::deepest_value_type<        \
+            buf_name_prefix##_list_type>::type;                              \
+        auto buf_name_prefix##_value_vec = vecnd_detail::flatten_all(list);  \
+        return sycl::buffer<value_type>(buf_name_prefix##_value_vec.begin(), \
+                                        buf_name_prefix##_value_vec.end());  \
+    }();                                                                     \
+    auto [buf_name_prefix##_offsets_buf,                                     \
+          buf_name_prefix##_level_offsets] = [&]() {                         \
+        auto buf_name_prefix##_offsets_data =                                \
+            vecnd_detail::build_offsets(list);                               \
+        auto buf_name_prefix##_level_offsets =                               \
+            std::move(buf_name_prefix##_offsets_data.level_offsets);         \
+        auto buf_name_prefix##_offsets_buf =                                 \
+            sycl::buffer<int>(buf_name_prefix##_offsets_data.flat.begin(),   \
+                              buf_name_prefix##_offsets_data.flat.end());    \
+        return std::make_pair(std::move(buf_name_prefix##_offsets_buf),      \
+                              std::move(buf_name_prefix##_level_offsets));   \
+    }()
 
 #define vecnd_buffer_accessors(buf_name_prefix)             \
     sycl::accessor buf_name_prefix##_value_ax(              \
@@ -2190,20 +2202,28 @@ void HansenCoppens_SF_Engine4::calculateSF(
         return tmp;                  \
     }())
 
-#define vector_of_Vector3_to_buffer(type, value, name_prefix)        \
-    std::vector<sycl::vec<type, 3>> name_prefix##_vec(value.size()); \
-    for (size_t i = 0; i < value.size(); ++i) {                      \
-        Vector3<type> vec = value[i];                                \
-        name_prefix##_vec[i] = Vector3_to_vec(type, vec);            \
-    }                                                                \
-    sycl::buffer<sycl::vec<type, 3>> name_prefix##_buf(name_prefix##_vec);
+#define vector_of_Vector3_to_buffer(type, value, name_prefix)              \
+    auto name_prefix##_buf = [&]() {                                       \
+        std::vector<sycl::vec<type, 3>> name_prefix##_vec(value.size());   \
+        for (size_t i = 0; i < value.size(); ++i) {                        \
+            Vector3<type> vec = value[i];                                  \
+            name_prefix##_vec[i] = Vector3_to_vec(type, vec);              \
+        }                                                                  \
+        return sycl::buffer<sycl::vec<type, 3>>(name_prefix##_vec.begin(), \
+                                                name_prefix##_vec.end());  \
+    }();
 
-#define vector_of_objects_to_buffer_of_values_for_property( \
-    type, list, prop, name_prefix)                          \
-    std::vector<type> name_prefix##_vec(list.size());       \
-    for (size_t i = 0; i < list.size(); ++i)                \
-        name_prefix##_vec[i] = list[i].prop;                \
-    sycl::buffer<type> name_prefix##_buf(name_prefix##_vec);
+#define vector_of_objects_to_buffer_of_values_for_property(  \
+    type, list, prop, name_prefix)                           \
+    auto name_prefix##_buf = [&]() {                         \
+        std::vector<type> name_prefix##_vec;                 \
+        name_prefix##_vec.reserve(list.size());              \
+        for (const auto &item : list) {                      \
+            name_prefix##_vec.push_back(item.prop);          \
+        }                                                    \
+        return sycl::buffer<type>(name_prefix##_vec.begin(), \
+                                  name_prefix##_vec.end());  \
+    }();
 
 #define flattened(list)                                              \
     ([list]() {                                                      \
@@ -2224,14 +2244,18 @@ void HansenCoppens_SF_Engine4::calculateSF(
         return offsets;                \
     }())
 
-#define vecvec_to_buffers(list, buf_name_prefix)                             \
-    auto buf_name_prefix##_tmp = flattened(list);                            \
-    sycl::buffer<                                                            \
-        std::remove_reference<decltype(list)>::type::value_type::value_type> \
-        buf_name_prefix##_value_buf(buf_name_prefix##_tmp);                  \
-    std::vector<int> buf_name_prefix##_offset_tmp = offsets(list);           \
-    sycl::buffer<int> buf_name_prefix##_offset_buf(                          \
-        buf_name_prefix##_offset_tmp);
+#define vecvec_to_buffers(list, buf_name_prefix)                         \
+    auto buf_name_prefix##_value_buf = [&]() {                           \
+        auto buf_name_prefix##_tmp = flattened(list);                    \
+        return sycl::buffer<std::remove_reference<                       \
+            decltype(list)>::type::value_type::value_type>(              \
+            buf_name_prefix##_tmp.begin(), buf_name_prefix##_tmp.end()); \
+    }();                                                                 \
+    auto buf_name_prefix##_offset_buf = [&]() {                          \
+        std::vector<int> buf_name_prefix##_offset_tmp = offsets(list);   \
+        return sycl::buffer<int>(buf_name_prefix##_offset_tmp.begin(),   \
+                                 buf_name_prefix##_offset_tmp.end());    \
+    }();
 
 #define vector_times_matrix(vector, col0, col1, col2)  \
     ([vector, col0, col1, col2]() {                    \
@@ -2257,14 +2281,19 @@ void HansenCoppens_SF_Engine4::calculateSF(
         return res;                                                \
     }())
 
-#define vec_of_matrix_to_column_buffers(list, buf_name_prefix)      \
-    auto buf_name_prefix##_tmp = vec_of_matrix_to_columns(list);    \
-    sycl::buffer<sycl::vec<REAL, 3>> buf_name_prefix##_column0_buf( \
-        buf_name_prefix##_tmp[0]);                                  \
-    sycl::buffer<sycl::vec<REAL, 3>> buf_name_prefix##_column1_buf( \
-        buf_name_prefix##_tmp[1]);                                  \
-    sycl::buffer<sycl::vec<REAL, 3>> buf_name_prefix##_column2_buf( \
-        buf_name_prefix##_tmp[2]);
+#define vec_of_matrix_to_column_buffers(list, buf_name_prefix)               \
+    auto [buf_name_prefix##_column0_buf,                                     \
+          buf_name_prefix##_column1_buf,                                     \
+          buf_name_prefix##_column2_buf] = [&]() {                           \
+        auto buf_name_prefix##_tmp = vec_of_matrix_to_columns(list);         \
+        using buffer_type = sycl::buffer<sycl::vec<REAL, 3>>;                \
+        return std::make_tuple(buffer_type(buf_name_prefix##_tmp[0].begin(), \
+                                           buf_name_prefix##_tmp[0].end()),  \
+                               buffer_type(buf_name_prefix##_tmp[1].begin(), \
+                                           buf_name_prefix##_tmp[1].end()),  \
+                               buffer_type(buf_name_prefix##_tmp[2].begin(), \
+                                           buf_name_prefix##_tmp[2].end())); \
+    }();
 
     sycl::range<1> job_num(hklCount);
 
@@ -2312,7 +2341,7 @@ void HansenCoppens_SF_Engine4::calculateSF(
     vecvec_to_buffers(atomic_displacement_parameters,
                       atomic_displacement_parameters);
     size_t atomic_displacement_parameter_count =
-        atomic_displacement_parameters_tmp.size();
+        atomic_displacement_parameters_value_buf.size();
     size_t atomic_displacement_parameters_size =
         atomic_displacement_parameters.size();
 
@@ -2424,31 +2453,51 @@ void HansenCoppens_SF_Engine4::calculateSF(
         wfn_param_metas.push_back(meta);
     }
 
-    sycl::buffer<wfn_param_meta> wfn_param_metas_buff(wfn_param_metas);
-    sycl::buffer<REAL> core_coeffs_buff(core_coeffs);
-    sycl::buffer<REAL> core_exps_buff(core_exps);
-    sycl::buffer<int> core_pows_buff(core_pows);
-    sycl::buffer<REAL> valence_coeffs_buff(valence_coeffs);
-    sycl::buffer<REAL> valence_exps_buff(valence_exps);
-    sycl::buffer<int> valence_pows_buff(valence_pows);
-    sycl::buffer<int> def_valence_pows_buff(def_valence_pows);
-    sycl::buffer<std::complex<REAL>> anomalous_scatterings_buff(
-        anomalous_scatterings);
+    constexpr auto make_buffer = [](auto values) {
+        using value_type = typename decltype(values)::value_type;
+        return sycl::buffer<value_type>(values.begin(), values.end());
+    };
 
-    std::vector<int> type_p_lm_sizes_vec(typeParams.size());
-    for (int i = 0; i < typeParams.size(); ++i)
-        type_p_lm_sizes_vec[i] = typeParams[i].p_lm.size();
-    sycl::buffer<int> type_p_lm_sizes_buf(type_p_lm_sizes_vec);
+    auto wfn_param_metas_buff = make_buffer(std::move(wfn_param_metas));
+    auto core_coeffs_buff = make_buffer(std::move(core_coeffs));
+    auto core_exps_buff = make_buffer(std::move(core_exps));
+    auto core_pows_buff = make_buffer(std::move(core_pows));
+    auto valence_coeffs_buff = make_buffer(std::move(valence_coeffs));
+    auto valence_exps_buff = make_buffer(std::move(valence_exps));
+    auto valence_pows_buff = make_buffer(std::move(valence_pows));
+    auto def_valence_pows_buff = make_buffer(std::move(def_valence_pows));
+    auto anomalous_scatterings_buff =
+        make_buffer(std::move(anomalous_scatterings));
 
-    std::vector<sycl::vec<REAL, 3>> atomic_position_derivatives_vec(
-        dTarget_dparam.size(), sycl::vec{0., 0., 0.});
-    sycl::buffer<sycl::vec<REAL, 3>> atomic_position_derivatives_buf(
-        atomic_position_derivatives_vec);
-    std::vector<std::array<REAL, 6>> adp_derivatives_vec(
-        dTarget_dparam.size(), std::array{0., 0., 0., 0., 0., 0.});
-    sycl::buffer<std::array<REAL, 6>> adp_derivatives_buf(adp_derivatives_vec);
-    std::vector<REAL> occupancy_derivatives_vec(dTarget_dparam.size(), 0);
-    sycl::buffer<REAL> occupancy_derivatives_buf(occupancy_derivatives_vec);
+    auto type_p_lm_sizes_buf = [&]() {
+        std::vector<int> type_p_lm_sizes_vec(typeParams.size());
+        for (int i = 0; i < typeParams.size(); ++i)
+            type_p_lm_sizes_vec[i] = typeParams[i].p_lm.size();
+        return sycl::buffer<int>(type_p_lm_sizes_vec.begin(),
+                                 type_p_lm_sizes_vec.end());
+    }();
+
+    auto atomic_position_derivatives_buf = [&]() {
+        std::vector<sycl::vec<REAL, 3>> atomic_position_derivatives_vec(
+            dTarget_dparam.size(), sycl::vec{0., 0., 0.});
+        return sycl::buffer<sycl::vec<REAL, 3>>(
+            atomic_position_derivatives_vec.begin(),
+            atomic_position_derivatives_vec.end());
+    }();
+
+    auto adp_derivatives_buf = [&]() {
+        std::vector<std::array<REAL, 6>> adp_derivatives_vec(
+            dTarget_dparam.size(), std::array{0., 0., 0., 0., 0., 0.});
+        return sycl::buffer<std::array<REAL, 6>>(adp_derivatives_vec.begin(),
+                                                 adp_derivatives_vec.end());
+    }();
+
+    auto occupancy_derivatives_buf = [&]() {
+        std::vector<REAL> occupancy_derivatives_vec(dTarget_dparam.size(), 0);
+        return sycl::buffer<REAL>(occupancy_derivatives_vec.begin(),
+                                  occupancy_derivatives_vec.end());
+    }();
+
     sycl::buffer<std::complex<REAL>> dtarget_df_buf(dTarget_df);
     sycl::buffer<std::complex<REAL>> anomalous_dispersion_buf(
         anomalous_dispersion);
