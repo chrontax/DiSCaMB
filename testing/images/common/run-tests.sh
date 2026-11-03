@@ -130,7 +130,7 @@ run_tests() {
 
     log "running pytest in $tests_dir"
     local rc=0
-    (cd "$tests_dir" && "$ENV_EXEC" sycl python -m pytest -p no:cacheprovider -rA \
+    (cd "$tests_dir" && "$ENV_EXEC" sycl python -m pytest -s -p no:cacheprovider -rA \
         --junitxml="$RESULTS/junit.xml" "${extra[@]}" .) || rc=$?
     # pytest exit code 5 means no tests were collected.
     if [ "$rc" -eq 5 ]; then
