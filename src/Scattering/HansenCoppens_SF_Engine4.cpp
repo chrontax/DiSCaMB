@@ -27,6 +27,9 @@
 
 #ifdef SYCL
 #include <algorithm>
+#include <array>
+#include <ctime>
+#include <iostream>
 #include <numeric>
 #include <sycl/sycl.hpp>
 #include <tuple>
@@ -38,154 +41,7 @@
 #include "sycl/buffer.hpp"
 #include "sycl/memory_enums.hpp"
 
-namespace vecnd_detail {
-
-template <typename T>
-struct is_list : std::false_type {};
-
-template <typename T, typename Alloc>
-struct is_list<std::vector<T, Alloc>> : std::true_type {};
-
-template <typename T, std::size_t N>
-struct is_list<std::array<T, N>> : std::true_type {};
-
-template <typename T>
-struct list_depth : std::integral_constant<std::size_t, 0> {};
-
-template <typename T, typename Alloc>
-struct list_depth<std::vector<T, Alloc>>
-    : std::integral_constant<std::size_t, 1 + list_depth<T>::value> {};
-
-template <typename T, std::size_t N>
-struct list_depth<std::array<T, N>>
-    : std::integral_constant<std::size_t, 1 + list_depth<T>::value> {};
-
-template <typename T>
-struct deepest_value_type {
-    using type = T;
-};
-
-template <typename T, typename Alloc>
-struct deepest_value_type<std::vector<T, Alloc>> {
-    using type = typename deepest_value_type<T>::type;
-};
-
-template <typename T, std::size_t N>
-struct deepest_value_type<std::array<T, N>> {
-    using type = typename deepest_value_type<T>::type;
-};
-
-template <typename Vec, typename Out>
-inline void flatten_impl(const Vec &list, Out &out) {
-    if constexpr (is_list<typename Vec::value_type>::value) {
-        for (const auto &sub : list) flatten_impl(sub, out);
-    } else {
-        for (const auto &el : list) out.push_back(el);
-    }
-}
-
-template <typename Vec>
-inline auto flatten_all(const Vec &list) {
-    using value_type = typename deepest_value_type<Vec>::type;
-    std::vector<value_type> out;
-    flatten_impl(list, out);
-    return out;
-}
-
-template <typename Vec, std::size_t N>
-inline void offsets_impl(const Vec &list,
-                         std::array<std::vector<int>, N> &offsets,
-                         std::array<int, N> &running, std::size_t level = 0) {
-    using Inner = typename Vec::value_type;
-    if constexpr (is_list<Inner>::value) {
-        for (const auto &sub : list) {
-            offsets[level].push_back(running[level]);
-            running[level] += static_cast<int>(sub.size());
-            offsets_impl(sub, offsets, running, level + 1);
-        }
-    }
-}
-
-template <std::size_t Depth>
-struct offsets_data {
-    std::vector<int> flat;
-    std::array<int, Depth - 1> level_offsets;
-};
-
-template <typename Vec>
-inline auto build_offsets(const Vec &list) {
-    constexpr std::size_t Depth = list_depth<Vec>::value;
-    static_assert(Depth >= 2,
-                  "vecnd_to_buffers requires nested std::vector depth >= 2");
-    offsets_data<Depth> result;
-    std::array<std::vector<int>, Depth - 1> per_level;
-    std::array<int, Depth - 1> running{};
-    offsets_impl(list, per_level, running, 0);
-    int total = 0;
-    for (std::size_t level = 0; level < Depth - 1; ++level) {
-        result.level_offsets[level] = total;
-        total += static_cast<int>(per_level[level].size());
-    }
-    result.flat.reserve(total);
-    for (std::size_t level = 0; level < Depth - 1; ++level)
-        result.flat.insert(result.flat.end(),
-                           per_level[level].begin(),
-                           per_level[level].end());
-    return result;
-}
-
-template <typename OffsetAccessor, std::size_t N>
-inline int index_flat(const OffsetAccessor &offsets_ax,
-                      const std::array<int, N> &level_offsets,
-                      const std::array<int, N + 1> &indices) {
-    int idx = indices[0];
-    for (std::size_t level = 0; level < N; ++level)
-        idx = offsets_ax[level_offsets[level] + idx] + indices[level + 1];
-    return idx;
-}
-
-}  // namespace vecnd_detail
-
-#define vecnd_to_buffers(list, buf_name_prefix)                              \
-    using buf_name_prefix##_list_type = std::decay_t<decltype(list)>;        \
-    constexpr std::size_t buf_name_prefix##_depth =                          \
-        vecnd_detail::list_depth<buf_name_prefix##_list_type>::value;        \
-    auto buf_name_prefix##_value_buf = [&]() {                               \
-        using value_type = typename vecnd_detail::deepest_value_type<        \
-            buf_name_prefix##_list_type>::type;                              \
-        auto buf_name_prefix##_value_vec = vecnd_detail::flatten_all(list);  \
-        return sycl::buffer<value_type>(buf_name_prefix##_value_vec.begin(), \
-                                        buf_name_prefix##_value_vec.end());  \
-    }();                                                                     \
-    auto [buf_name_prefix##_offsets_buf,                                     \
-          buf_name_prefix##_level_offsets] = [&]() {                         \
-        auto buf_name_prefix##_offsets_data =                                \
-            vecnd_detail::build_offsets(list);                               \
-        auto buf_name_prefix##_level_offsets =                               \
-            std::move(buf_name_prefix##_offsets_data.level_offsets);         \
-        auto buf_name_prefix##_offsets_buf =                                 \
-            sycl::buffer<int>(buf_name_prefix##_offsets_data.flat.begin(),   \
-                              buf_name_prefix##_offsets_data.flat.end());    \
-        return std::make_pair(std::move(buf_name_prefix##_offsets_buf),      \
-                              std::move(buf_name_prefix##_level_offsets));   \
-    }()
-
-#define vecnd_buffer_accessors(buf_name_prefix)             \
-    sycl::accessor buf_name_prefix##_value_ax(              \
-        buf_name_prefix##_value_buf, cgh, sycl::read_only); \
-    sycl::accessor buf_name_prefix##_offset_ax(             \
-        buf_name_prefix##_offsets_buf, cgh, sycl::read_only);
-
-#define index_vecnd_buffer(buf_name_prefix, ...)          \
-    (buf_name_prefix##_value_ax[vecnd_detail::index_flat( \
-        buf_name_prefix##_offset_ax,                      \
-        buf_name_prefix##_level_offsets,                  \
-        std::array<int, buf_name_prefix##_depth>{__VA_ARGS__})])
 #endif
-
-#include <array>
-#include <ctime>
-#include <iostream>
 
 using namespace std;
 
@@ -2356,9 +2212,25 @@ void HansenCoppens_SF_Engine4::calculateSF(
     sycl::buffer<int> atom_to_type_map_buf(atom_to_type_map);
     sycl::buffer<int> sym_op_to_offset_buf(symOpToOffset);
 
-    std::vector<std::vector<std::vector<REAL>>> type_p_lm_vec;
-    for (auto &type : typeParams) type_p_lm_vec.push_back(type.p_lm);
-    vecnd_to_buffers(type_p_lm_vec, type_p_lm);
+    // p_lm of type t flattened; row l holds 2l+1 values, so rows 0..l-1 take
+    // l*l entries and (l, m) is at typePlmOffsets[t] + l * l + (m + l)
+    std::vector<REAL> typePlm;
+    std::vector<int> typePlmOffsets;
+    typePlmOffsets.reserve(typeParams.size());
+    for (const auto &type : typeParams) {
+        typePlmOffsets.push_back(typePlm.size());
+        for (int l = 0; l < type.p_lm.size(); l++) {
+            if (type.p_lm[l].size() != 2 * l + 1)
+                on_error::throwException(
+                    string("p_lm[l] must have 2l+1 elements"),
+                    __FILE__,
+                    __LINE__);
+            typePlm.insert(
+                typePlm.end(), type.p_lm[l].begin(), type.p_lm[l].end());
+        }
+    }
+    sycl::buffer<REAL> type_p_lm_buf(typePlm);
+    sycl::buffer<int> type_p_lm_offsets_buf(typePlmOffsets);
 
     vecvec_to_buffers(atomic_displacement_parameters,
                       atomic_displacement_parameters);
@@ -2599,7 +2471,9 @@ void HansenCoppens_SF_Engine4::calculateSF(
         sycl::accessor anomalous_dispersion_ax(
             anomalous_dispersion_buf, cgh, sycl::read_only);
 
-        vecnd_buffer_accessors(type_p_lm);
+        sycl::accessor type_p_lm_ax(type_p_lm_buf, cgh, sycl::read_only);
+        sycl::accessor type_p_lm_offsets_ax(
+            type_p_lm_offsets_buf, cgh, sycl::read_only);
 
         // Wfn params
         sycl::accessor wfn_param_metas_ax(
@@ -2786,6 +2660,7 @@ void HansenCoppens_SF_Engine4::calculateSF(
                     std::complex<REAL> dval;
                     const int used_wfn_i = used_wfn_type_combo_ax
                         [atom_to_used_wfn_type_combo_ax[atom_i]][0];
+                    const int p_lm_off = type_p_lm_offsets_ax[type_i];
                     for (int l = 0; l < nl; l++) {
                         // may be ordered differently than in publication
                         // because the publication doesn't seem to have a
@@ -2802,9 +2677,9 @@ void HansenCoppens_SF_Engine4::calculateSF(
 
                         REAL sumPerM = 0.0;
                         for (int m = -l; m <= l; m++) {
-                            sumPerM += index_vecnd_buffer(
-                                           type_p_lm, type_i, l, m + l) *
-                                       densityNormalizedSycl(h, l, m);
+                            sumPerM +=
+                                type_p_lm_ax[p_lm_off + l * l + (m + l)] *
+                                densityNormalizedSycl(h, l, m);
                         }
                         dval += n_value_ax[n_offset_ax[wfn_i] + l] *
                                 (multPerL * sumPerM);
