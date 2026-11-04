@@ -1446,8 +1446,10 @@ void HansenCoppens_SF_Engine4::calculateSF(
                         symOpT(i, j) = symOpMults[symOpIdx](j, i);
                     }
                 }
+                // h is rotated as R^T h, so the exponent
+                // (R^T h)^T U (R^T h) needs U' = R U R^T (as in Engine3)
                 rotatedUs[atom][symOpIdx] =
-                    symOpT * orig * symOpMults[symOpIdx];
+                    symOpMults[symOpIdx] * orig * symOpT;
                 /*
                  *                // trying to do M = symOp * orig * symOp^T
                  *                // because orig^T = orig and M^T = M
