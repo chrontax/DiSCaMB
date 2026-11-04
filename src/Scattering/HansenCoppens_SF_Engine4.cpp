@@ -2165,16 +2165,37 @@ void HansenCoppens_SF_Engine4::calculateSF(
     vector_of_Vector3_to_buffer(int, hkl_indices, hkl);
 
     sycl::buffer<std::complex<REAL>> f_buf(hklCount);
-    // used atoms ordered by (wfn, combo), so the kernel recomputes the core
-    // and valence form factors only when they change
+    // per atom type: highest l with a non-zero population, capped by the
+    // wavefunction (as in Engine3); -1 for spherical (HC-IAM) types
+    std::vector<int> typeMaxL;
+    {
+        std::vector<int> type2Wfn;
+        std::vector<std::vector<REAL>> defValSlaterNormalization;
+        pre_hkl_loop_sf_calc(wfnParams,
+                             typeParams,
+                             atom_to_wfn_map,
+                             atom_to_type_map,
+                             type2Wfn,
+                             defValSlaterNormalization,
+                             typeMaxL);
+    }
+    sycl::buffer<int> type_max_l_buf(typeMaxL);
+
+    // used atoms ordered by (spherical, wfn, combo): spherical and multipolar
+    // atoms do not mix within a stretch of the atom loop, and the kernel
+    // recomputes the core and valence form factors only when they change
     auto atom_order_buf = [&]() {
         std::vector<int> order(nAtoms);
         std::iota(order.begin(), order.end(), 0);
+        const auto key = [&](int atom) {
+            const int combo = atomToUsedWfnTypeCombo[atom];
+            const bool spherical =
+                typeMaxL[atom_to_type_map[usedAtomIndices[atom]]] < 0;
+            return std::make_tuple(
+                !spherical, usedWfnTypeCombo[combo][0], combo);
+        };
         std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-            const int comboA = atomToUsedWfnTypeCombo[a];
-            const int comboB = atomToUsedWfnTypeCombo[b];
-            return std::make_pair(usedWfnTypeCombo[comboA][0], comboA) <
-                   std::make_pair(usedWfnTypeCombo[comboB][0], comboB);
+            return key(a) < key(b);
         });
         return sycl::buffer<int>(order.begin(), order.end());
     }();
@@ -2371,14 +2392,6 @@ void HansenCoppens_SF_Engine4::calculateSF(
     auto anomalous_scatterings_buff =
         make_buffer(std::move(anomalous_scatterings));
 
-    auto type_p_lm_sizes_buf = [&]() {
-        std::vector<int> type_p_lm_sizes_vec(typeParams.size());
-        for (int i = 0; i < typeParams.size(); ++i)
-            type_p_lm_sizes_vec[i] = typeParams[i].p_lm.size();
-        return sycl::buffer<int>(type_p_lm_sizes_vec.begin(),
-                                 type_p_lm_sizes_vec.end());
-    }();
-
     auto atomic_position_derivatives_buf = [&]() {
         std::vector<sycl::vec<REAL, 3>> atomic_position_derivatives_vec(
             dTarget_dparam.size(), sycl::vec{0., 0., 0.});
@@ -2471,8 +2484,7 @@ void HansenCoppens_SF_Engine4::calculateSF(
         sycl::accessor sym_op_offsets_ax(
             sym_op_offsets_buf, cgh, sycl::read_only);
         sycl::accessor rotated_us_ax(rotated_us_buf, cgh, sycl::read_only);
-        sycl::accessor type_p_lm_sizes_ax(
-            type_p_lm_sizes_buf, cgh, sycl::read_only);
+        sycl::accessor type_max_l_ax(type_max_l_buf, cgh, sycl::read_only);
         sycl::accessor anomalous_scattering_ax(
             anomalous_scatterings_buff, cgh, sycl::read_only);
         sycl::accessor atomic_position_derivatives_ax(
@@ -2651,33 +2663,37 @@ void HansenCoppens_SF_Engine4::calculateSF(
                     const auto type_i =
                         atom_to_type_map_ax[used_atom_indices_ax[atom_i]];
 
-                    auto sym_op_mult_col0 = sym_op_mults_column0_ax[symOpIdx];
-                    auto sym_op_mult_col1 = sym_op_mults_column1_ax[symOpIdx];
-                    auto sym_op_mult_col2 = sym_op_mults_column2_ax[symOpIdx];
-                    auto local_coordinate_system_col0 =
-                        local_coordinate_systems_column0_ax
-                            [used_atom_indices_ax[atom_i]];
-                    auto local_coordinate_system_col1 =
-                        local_coordinate_systems_column1_ax
-                            [used_atom_indices_ax[atom_i]];
-                    auto local_coordinate_system_col2 =
-                        local_coordinate_systems_column2_ax
-                            [used_atom_indices_ax[atom_i]];
-                    auto h_times_sym = vector_times_matrix(h_versor,
-                                                           sym_op_mult_col0,
-                                                           sym_op_mult_col1,
-                                                           sym_op_mult_col2);
-                    const auto h =
-                        vector_times_matrix(h_times_sym,
-                                            local_coordinate_system_col0,
-                                            local_coordinate_system_col1,
-                                            local_coordinate_system_col2);
+                    // spherical (HC-IAM) types have nl = 0: no deformation
+                    // term and no local frame
+                    const int nl = type_max_l_ax[type_i] + 1;
+                    sycl::vec<REAL, 3> h(0.0);
+                    if (nl > 0) {
+                        auto sym_op_mult_col0 =
+                            sym_op_mults_column0_ax[symOpIdx];
+                        auto sym_op_mult_col1 =
+                            sym_op_mults_column1_ax[symOpIdx];
+                        auto sym_op_mult_col2 =
+                            sym_op_mults_column2_ax[symOpIdx];
+                        auto local_coordinate_system_col0 =
+                            local_coordinate_systems_column0_ax
+                                [used_atom_indices_ax[atom_i]];
+                        auto local_coordinate_system_col1 =
+                            local_coordinate_systems_column1_ax
+                                [used_atom_indices_ax[atom_i]];
+                        auto local_coordinate_system_col2 =
+                            local_coordinate_systems_column2_ax
+                                [used_atom_indices_ax[atom_i]];
+                        auto h_times_sym =
+                            vector_times_matrix(h_versor,
+                                                sym_op_mult_col0,
+                                                sym_op_mult_col1,
+                                                sym_op_mult_col2);
+                        h = vector_times_matrix(h_times_sym,
+                                                local_coordinate_system_col0,
+                                                local_coordinate_system_col1,
+                                                local_coordinate_system_col2);
+                    }
 
-                    const int nl = std::min(
-                        (int)wfn_param_metas_ax[used_wfn_type_combo_ax[combo_i]
-                                                                      [0]]
-                            .def_valence_pow_sz,
-                        type_p_lm_sizes_ax[type_i]);
                     std::complex<REAL> dval;
                     const int used_wfn_i = used_wfn_type_combo_ax
                         [atom_to_used_wfn_type_combo_ax[atom_i]][0];
