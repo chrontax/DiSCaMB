@@ -2596,7 +2596,8 @@ void HansenCoppens_SF_Engine4::calculateSF(
                 const auto anomalous =
                     anomalous_dispersion_empty
 
-                        ? anomalous_scattering_ax[wfn_i]
+                        ? anomalous_scattering_ax
+                              [used_wfn_type_combo_ax[combo_i][0]]
                         : anomalous_dispersion_ax[used_atom_indices_ax[atom_i]];
 
                 std::array<std::complex<REAL>, 6> d_adp_p;
@@ -2673,7 +2674,9 @@ void HansenCoppens_SF_Engine4::calculateSF(
                                             local_coordinate_system_col2);
 
                     const int nl = std::min(
-                        (int)wfn_param_metas_ax[wfn_i].def_valence_pow_sz,
+                        (int)wfn_param_metas_ax[used_wfn_type_combo_ax[combo_i]
+                                                                      [0]]
+                            .def_valence_pow_sz,
                         type_p_lm_sizes_ax[type_i]);
                     std::complex<REAL> dval;
                     const int used_wfn_i = used_wfn_type_combo_ax
