@@ -2405,6 +2405,18 @@ void HansenCoppens_SF_Engine4::calculateSF(
         anomalous_dispersion);
     const bool anomalous_dispersion_empty = anomalous_dispersion.empty();
 
+    // per atom (all atoms): Z and electron form factor at h = 0, used by the
+    // Mott-Bethe conversion when electron scattering is on
+    std::vector<REAL> atomicNumbersReal(trueNAtoms, 0.0);
+    std::vector<REAL> electronF000(trueNAtoms, 0.0);
+    if (electron) {
+        electronScatteringAt000(atomic_numbers, electronF000);
+        for (int i = 0; i < trueNAtoms; i++)
+            atomicNumbersReal[i] = atomic_numbers[i];
+    }
+    sycl::buffer<REAL> atomic_numbers_buf(atomicNumbersReal);
+    sycl::buffer<REAL> electron_f000_buf(electronF000);
+
     queue.submit([&](sycl::handler &cgh) {
         sycl::accessor f_ax(f_buf, cgh, sycl::write_only);
         sycl::accessor atom_order_ax(atom_order_buf, cgh, sycl::read_only);
@@ -2472,6 +2484,10 @@ void HansenCoppens_SF_Engine4::calculateSF(
         sycl::accessor dtarget_df_ax(dtarget_df_buf, cgh, sycl::read_only);
         sycl::accessor anomalous_dispersion_ax(
             anomalous_dispersion_buf, cgh, sycl::read_only);
+        sycl::accessor atomic_numbers_ax(
+            atomic_numbers_buf, cgh, sycl::read_only);
+        sycl::accessor electron_f000_ax(
+            electron_f000_buf, cgh, sycl::read_only);
 
         sycl::accessor type_p_lm_ax(type_p_lm_buf, cgh, sycl::read_only);
         sycl::accessor type_p_lm_offsets_ax(
@@ -2687,8 +2703,21 @@ void HansenCoppens_SF_Engine4::calculateSF(
                                 (multPerL * sumPerM);
                     }
 
-                    perAtomF +=
-                        symOpFMult * localF * (dval + f_core + val + anomalous);
+                    // Mott-Bethe, as in Engine3; anomalous is not converted
+                    std::complex<REAL> atomic_ff = dval + f_core + val;
+                    if (electron) {
+                        const int true_atom = used_atom_indices_ax[atom_i];
+                        if (h_length < 1e-10)
+                            atomic_ff = electron_f000_ax[true_atom];
+                        else
+                            atomic_ff =
+                                0.023934 *
+                                (atomic_numbers_ax[true_atom] - atomic_ff) /
+                                (0.25 * h_length_sq);
+                    }
+                    atomic_ff += anomalous;
+
+                    perAtomF += symOpFMult * localF * atomic_ff;
 
                     auto col0 = sym_op_mults_column0_ax[symOpIdx];
                     auto col1 = sym_op_mults_column1_ax[symOpIdx];
@@ -2706,14 +2735,13 @@ void HansenCoppens_SF_Engine4::calculateSF(
                             h_rot[1] * h_rot[2] * 2};
                         for (int i = 0; i < 6; i++) {
                             d_adp_p[i] += d_adp_p_part[i] * symOpFMult *
-                                          localF *
-                                          (dval + f_core + val + anomalous);
+                                          localF * atomic_ff;
                         }
                     }
                     if (derivativesSwitch.d_xyz) {
                         for (int i = 0; i < 3; i++) {
-                            d_xyz_p[i] += h_rot[i] * symOpFMult * localF *
-                                          (dval + f_core + val + anomalous);
+                            d_xyz_p[i] +=
+                                h_rot[i] * symOpFMult * localF * atomic_ff;
                         }
                     }
                 }
