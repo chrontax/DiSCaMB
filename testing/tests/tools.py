@@ -1,14 +1,16 @@
 """Diagnostic helpers importable from the discamb container tests.
 
-``GpuMemoryProfiler`` samples GPU memory between ``start()`` and ``stop()`` with
-the vendor tool of the backend it detects (cuda -> ``nvidia-smi``, sampled every
-``DEFAULT_INTERVAL_MS`` milliseconds). ``start()`` takes a one-shot reading as
+``GpuMemoryProfiler`` samples GPU memory between ``start()`` and ``stop()``
+every ``DEFAULT_INTERVAL_MS`` milliseconds with the source of the backend it
+detects: cuda -> ``nvidia-smi``; hip -> amdgpu sysfs (VRAM + GTT in use);
+level_zero -> DRM fdinfo of the i915/xe clients in this container. ``start()`` takes a one-shot reading as
 the baseline and fails there if the tool does not work; ``stop()`` returns a
 ``MemoryProfile`` holding the peak and the mean of the samples, in MiB.
 """
 
 from __future__ import annotations
 
+import glob
 import os
 import shutil
 import signal
@@ -155,7 +157,119 @@ class NvidiaSmiSampler(_MemorySampler):
         return float(line)
 
 
-SAMPLERS: Tuple[Type[_MemorySampler], ...] = (NvidiaSmiSampler,)
+class _PollingSampler(_MemorySampler):
+    """Reads a kernel interface from a thread instead of running a tool."""
+
+    def read_once(self) -> float:
+        raise NotImplementedError
+
+    def start(self) -> None:
+        self.baseline = self.read_once()
+        self._stopping = threading.Event()
+        self._reader = threading.Thread(target=self._poll, daemon=True)
+        self._reader.start()
+
+    def _poll(self) -> None:
+        while True:
+            try:
+                self._samples.append(self.read_once())
+            except (OSError, RuntimeError, ValueError) as error:
+                if len(self._rejected) < 5:
+                    self._rejected.append(str(error))
+            if self._stopping.wait(self.interval_ms / 1000):
+                return
+
+    def stop(self) -> List[float]:
+        self._stopping.set()
+        self._reader.join(timeout=SAMPLER_STOP_TIMEOUT_S)
+        if not self._samples:
+            raise RuntimeError(
+                f"{self.tool} produced no memory samples (errors: {self._rejected})"
+            )
+        return self._samples
+
+
+MIB = 1024 * 1024
+
+
+def _amdgpu_devices() -> List[str]:
+    return sorted(
+        os.path.dirname(path)
+        for path in glob.glob("/sys/class/drm/card*/device/mem_info_vram_used")
+    )
+
+
+class AmdgpuSysfsSampler(_PollingSampler):
+    backend = "hip"
+    tool = "amdgpu sysfs"
+
+    @classmethod
+    def available(cls) -> bool:
+        return bool(_amdgpu_devices())
+
+    def read_once(self) -> float:
+        devices = _amdgpu_devices()
+        if self.device >= len(devices):
+            raise RuntimeError(f"no amdgpu device {self.device} (found {devices})")
+        used = 0
+        # GTT too: integrated GPUs place most buffers in system memory.
+        for name in ("mem_info_vram_used", "mem_info_gtt_used"):
+            with open(os.path.join(devices[self.device], name)) as f:
+                used += int(f.read())
+        return used / MIB
+
+
+_FDINFO_UNITS = {"": 1, "KiB": 1024, "MiB": MIB, "GiB": 1024 * MIB}
+
+
+class IntelFdinfoSampler(_PollingSampler):
+    """Sums drm-total-* of every i915/xe client open in this container.
+
+    Neither driver exposes device-wide usage, and xpu-smi covers only data
+    centre GPUs, so per-client DRM fdinfo is the one source that works for
+    integrated and Arc GPUs alike. ``device`` is ignored.
+    """
+
+    backend = "level_zero"
+    tool = "DRM fdinfo"
+
+    @classmethod
+    def available(cls) -> bool:
+        for vendor in glob.glob("/sys/class/drm/renderD*/device/vendor"):
+            with open(vendor) as f:
+                if f.read().strip() == "0x8086":
+                    return True
+        return False
+
+    def read_once(self) -> float:
+        clients = {}
+        for fd in glob.glob("/proc/[0-9]*/fd/*"):
+            try:
+                if not os.readlink(fd).startswith("/dev/dri/"):
+                    continue
+                with open(fd.replace("/fd/", "/fdinfo/", 1)) as f:
+                    info = dict(
+                        line.split(":", 1) for line in f.read().splitlines() if ":" in line
+                    )
+            except OSError:
+                continue  # the process or descriptor went away meanwhile
+            if info.get("drm-driver", "").strip() not in ("i915", "xe"):
+                continue
+            total = 0
+            for key, value in info.items():
+                if key.startswith("drm-total-"):
+                    number, _, unit = value.strip().partition(" ")
+                    total += int(number) * _FDINFO_UNITS[unit]
+            client = (info.get("drm-pdev", "").strip(), info.get("drm-client-id", fd).strip())
+            clients[client] = total
+        return sum(clients.values()) / MIB
+
+
+SAMPLERS: Tuple[Type[_MemorySampler], ...] = (
+    NvidiaSmiSampler,
+    AmdgpuSysfsSampler,
+    IntelFdinfoSampler,
+)
 
 
 def detect_backend() -> str:
