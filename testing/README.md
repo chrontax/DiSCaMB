@@ -8,6 +8,17 @@ backend decides how pyDiSCaMB is built, once per image:
 - `cuda`: SYCL build with DPC++ for NVIDIA GPUs. It runs Engine4 (`CPU_v4`) on
   the GPU and, from the same build, the CPU engines (`CPU` = Engine3), so CPU vs
   GPU comparisons happen inside this container.
+- `hip`: the same for AMD GPUs through DPC++'s HIP adapter (ROCm 6.4 runtime).
+  HIP code is compiled ahead of time; `test-linux.sh` reads the host's GPU
+  architectures from `/sys/class/kfd` and passes them as
+  `SYCL_TARGETS=amd_gpu_<gfx>[,...]`.
+- `level_zero`: the same for Intel GPUs, integrated (Xe, Tiger Lake and newer)
+  and Arc A/B, through Level Zero on Intel's compute-runtime. Kernels ship as
+  SPIR-V (`spir64`) and are JIT-compiled for the device found, so one build
+  serves every Intel GPU. Integrated Xe and Arc A-series lack FP64 hardware;
+  the images enable the driver's FP64 emulation
+  (`OverrideDefaultFP64Settings=1 IGC_EnableDPEmulation=1`), which is slow.
+  Arc B-series and Lunar Lake (Xe2) have native FP64.
 
 Tests that need the SYCL build carry `@pytest.mark.sycl` and are skipped on
 `cpu`.
@@ -34,7 +45,9 @@ NVIDIA Container Toolkit registered with docker, either as the `nvidia` runtime
 (`sudo nvidia-ctk runtime configure --runtime=docker`, restart docker) or as a
 CDI spec (`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`). The
 script uses whichever is present; it does not use `--gpus all`, which fails on
-Docker 29 without a CDI spec. The script installs nothing on the host.
+Docker 29 without a CDI spec. `hip` needs the amdgpu kernel driver (`/dev/kfd`
+and `/dev/dri` are passed to the container); `level_zero` needs the i915 or xe
+kernel driver (`/dev/dri`). The script installs nothing on the host.
 
 The sycl build enables `TAAM_WITH_GPU_IMP_26` so `HansenCoppens_SF_Engine4`
 (engine `CPU_v4`) is compiled. Logs, build
@@ -61,8 +74,11 @@ logs and `junit.xml` land in `testing/results/<timestamp>/<system>-<backend>/`.
   Python in the test environment (timed); also `backend`, `build`, `system`,
   `results_dir`, `source_dir`, and the `sycl` marker.
 - `tests/tools.py` holds diagnostics importable from tests. `GpuMemoryProfiler`
-  samples GPU memory every 10 ms with the vendor tool of the detected backend
-  (`cuda` -> `nvidia-smi --query-gpu=memory.used --loop-ms=10`):
+  samples GPU memory every 10 ms from the source of the detected backend
+  (`cuda` -> `nvidia-smi --query-gpu=memory.used --loop-ms=10`; `hip` ->
+  amdgpu sysfs `mem_info_vram_used + mem_info_gtt_used`; `level_zero` -> the
+  `drm-total-*` fdinfo of every i915/xe client in the container, since Intel
+  exposes no device-wide figure for integrated or Arc GPUs):
 
   ```python
   from tools import GpuMemoryProfiler

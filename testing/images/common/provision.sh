@@ -22,10 +22,8 @@ case "$BUILD_KIND" in
         curl -fsSL "https://github.com/intel/llvm/releases/download/${DPCPP_VERSION}/sycl_linux.tar.gz" \
             | tar -xz -C "$DPCPP_ROOT"
         "$DPCPP_ROOT/bin/clang++" --version
-        if [ "$TEST_BACKEND" = cuda ]; then
-            test -f "$DPCPP_ROOT/lib/libur_adapter_cuda.so" \
-                || { echo "DPC++ release lacks the CUDA adapter" >&2; exit 1; }
-        fi
+        test -f "$DPCPP_ROOT/lib/libur_adapter_${TEST_BACKEND}.so" \
+            || { echo "DPC++ release lacks the ${TEST_BACKEND} adapter" >&2; exit 1; }
         ;;
     native) ;;
     *) echo "unknown BUILD_KIND '$BUILD_KIND' (expected native or sycl)" >&2; exit 1 ;;

@@ -3,13 +3,14 @@
 # (linux system x backend) pair, for every backend usable on this machine: cpu
 # (native build) always, GPU backends (sycl build) when their GPU is present.
 # Installs nothing on the host; requires docker and, for CUDA, the NVIDIA
-# driver plus NVIDIA Container Toolkit.
+# driver plus NVIDIA Container Toolkit; for hip the amdgpu kernel driver
+# (/dev/kfd); for level_zero the i915 or xe kernel driver (/dev/dri).
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 IMAGES_DIR="$SCRIPT_DIR/images"
 IMAGE_PREFIX=discamb-test
-SUPPORTED_BACKENDS=(cuda cpu)
+SUPPORTED_BACKENDS=(cuda hip level_zero cpu)
 
 usage() {
     cat <<EOF
@@ -73,14 +74,62 @@ detect_cuda() {
 
 docker_gpu_args_cuda() { printf '%s\n' "${cuda_gpu_args[@]}"; }
 
+# KFD gfx_target_version (e.g. 90012, 110000) -> LLVM name (gfx90c, gfx1100).
+gfx_name() {
+    local v=$1
+    printf 'gfx%d%d%x\n' $((v / 10000)) $((v / 100 % 100)) $((v % 100))
+}
+
+hip_gpu_args=()
+
+# HIP code is compiled ahead of time, so the container gets the host's GPU
+# architectures as SYCL_TARGETS (amd_gpu_<gfx>, one per distinct GPU).
+detect_hip() {
+    local -a archs=()
+    local props v targets
+    if [ -e /dev/kfd ]; then
+        for props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
+            [ -r "$props" ] || continue
+            v=$(awk '$1 == "gfx_target_version" { print $2 }' "$props")
+            if [ "${v:-0}" -gt 0 ]; then archs+=("$(gfx_name "$v")"); fi
+        done
+    fi
+    if [ ${#archs[@]} -eq 0 ]; then
+        if pci_vendor_present 1002; then
+            warn "AMD GPU found on PCI bus but /dev/kfd shows no GPU (amdgpu driver missing?); skipping hip"
+        fi
+        return 1
+    fi
+    mapfile -t archs < <(printf '%s\n' "${archs[@]}" | sort -u)
+    targets=$(printf 'amd_gpu_%s,' "${archs[@]}")
+    hip_gpu_args=(--device /dev/kfd --device /dev/dri -e "SYCL_TARGETS=${targets%,}")
+    log "hip: GPU architectures ${archs[*]}"
+}
+
+docker_gpu_args_hip() { printf '%s\n' "${hip_gpu_args[@]}"; }
+
+# Intel GPUs (integrated and Arc) driven by i915 or xe.
+detect_level_zero() {
+    local dev driver found=0
+    for dev in /sys/class/drm/renderD*/device; do
+        [ "$(cat "$dev/vendor" 2>/dev/null)" = 0x8086 ] || continue
+        driver=$(basename "$(readlink -f "$dev/driver")")
+        case "$driver" in
+            i915|xe) found=1; log "level_zero: Intel GPU $(basename "$(readlink -f "$dev")") ($driver)" ;;
+        esac
+    done
+    if [ "$found" = 0 ]; then
+        if pci_vendor_present 8086; then
+            warn "Intel GPU found on PCI bus but no i915/xe render node; skipping level_zero"
+        fi
+        return 1
+    fi
+}
+
+docker_gpu_args_level_zero() { printf '%s\n' --device /dev/dri; }
+
 detect_cpu() { return 0; }
 docker_gpu_args_cpu() { :; }
-
-report_unsupported_gpus() {
-    pci_vendor_present 1002 && log "AMD GPU found; no backend images for it yet"
-    pci_vendor_present 8086 && log "Intel GPU found; no backend images for it yet"
-    return 0
-}
 
 systems_arg=""
 backends_arg=""
@@ -123,7 +172,6 @@ for b in "${SUPPORTED_BACKENDS[@]}"; do
         backends+=("$b")
     fi
 done
-report_unsupported_gpus
 [ ${#backends[@]} -gt 0 ] || die "no usable backend found"
 
 mkdir -p "$OUTPUT_DIR"
