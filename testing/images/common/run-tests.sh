@@ -42,9 +42,14 @@ die() {
     exit 1
 }
 
+# Only when the mount shows the host user as owner (rootful docker): under
+# rootless docker/podman container root already is the host user. Never fatal,
+# so a failed chown cannot replace the test result as the exit status.
 fix_results_owner() {
-    if [ -n "${HOST_UID:-}" ] && [ -d "$RESULTS" ]; then
-        chown -R "$HOST_UID:${HOST_GID:-$HOST_UID}" "$RESULTS"
+    if [ -n "${HOST_UID:-}" ] && [ -d "$RESULTS" ] \
+        && [ "$(stat -c %u "$RESULTS")" = "$HOST_UID" ]; then
+        chown -R "$HOST_UID:${HOST_GID:-$HOST_UID}" "$RESULTS" \
+            || printf '[%s] WARNING: could not chown %s to %s\n' "$TAG" "$RESULTS" "$HOST_UID" >&2
     fi
 }
 trap fix_results_owner EXIT
