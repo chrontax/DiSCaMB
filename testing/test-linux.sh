@@ -239,7 +239,9 @@ for backend in "${backends[@]}"; do
             continue
         fi
 
-        run_args=(--rm --init "${gpu_args[@]}"
+        # label=disable: on SELinux hosts (Fedora, RHEL) the container may not
+        # write to the bind mounts otherwise; it relabels nothing on the host.
+        run_args=(--rm --init --security-opt label=disable "${gpu_args[@]}"
             -e SOURCE_MODE="$SOURCE_MODE"
             -e PYTEST_ARGS="${pytest_args[*]}"
             -e DEBUG="$DEBUG"
